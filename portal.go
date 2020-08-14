@@ -1096,7 +1096,10 @@ func (portal *Portal) SetReply(content *event.MessageEventContent, info whatsapp
 			}
 		}
 		_ = evt.Content.ParseRaw(evt.Type)
+
+		oldBody := content.Body[:]
 		content.SetReply(evt)
+		content.Body = oldBody
 	}
 	return
 }
