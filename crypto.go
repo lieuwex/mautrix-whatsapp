@@ -36,6 +36,8 @@ import (
 	"maunium.net/go/mautrix-whatsapp/database"
 )
 
+var NoSessionFound = crypto.NoSessionFound
+
 var levelTrace = maulogger.Level{
 	Name:     "Trace",
 	Severity: -10,
@@ -105,7 +107,7 @@ func (helper *CryptoHelper) allowKeyShare(device *crypto.DeviceIdentity, info ev
 			return &crypto.KeyShareRejection{Code: event.RoomKeyWithheldUnavailable, Reason: "Requested room is not a portal room"}
 		}
 		user := helper.bridge.GetUserByMXID(device.UserID)
-		if !user.IsInPortal(portal.Key) {
+		if !user.Admin && !user.IsInPortal(portal.Key) {
 			helper.log.Debugfln("Rejecting key request for %s from %s/%s: user is not in portal", info.SessionID, device.UserID, device.DeviceID)
 			return &crypto.KeyShareRejection{Code: event.RoomKeyWithheldUnauthorized, Reason: "You're not in that portal"}
 		}
@@ -181,6 +183,10 @@ func (helper *CryptoHelper) Encrypt(roomID id.RoomID, evtType event.Type, conten
 		}
 	}
 	return encrypted, nil
+}
+
+func (helper *CryptoHelper) WaitForSession(roomID id.RoomID, senderKey id.SenderKey, sessionID id.SessionID, timeout time.Duration) bool {
+	return helper.mach.WaitForSession(roomID, senderKey, sessionID, timeout)
 }
 
 func (helper *CryptoHelper) HandleMemberEvent(evt *event.Event) {
