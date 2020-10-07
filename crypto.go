@@ -23,9 +23,9 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
+	"runtime/debug"
 	"time"
 
-	"github.com/pkg/errors"
 	"maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix"
@@ -151,10 +151,13 @@ func (helper *CryptoHelper) Start() {
 	err := helper.client.Sync()
 	if err != nil {
 		helper.log.Errorln("Fatal error syncing:", err)
+	} else {
+		helper.log.Infoln("Bridge bot to-device syncer stopped without error")
 	}
 }
 
 func (helper *CryptoHelper) Stop() {
+	helper.log.Debugln("CryptoHelper.Stop() called, stopping bridge bot sync")
 	helper.client.StopSync()
 }
 
@@ -171,15 +174,15 @@ func (helper *CryptoHelper) Encrypt(roomID id.RoomID, evtType event.Type, conten
 		helper.log.Debugfln("Got %v while encrypting event for %s, sharing group session and trying again...", err, roomID)
 		users, err := helper.store.GetRoomMembers(roomID)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to get room member list")
+			return nil, fmt.Errorf("failed to get room member list: %w", err)
 		}
 		err = helper.mach.ShareGroupSession(roomID, users)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to share group session")
+			return nil, fmt.Errorf("failed to share group session: %w", err)
 		}
 		encrypted, err = helper.mach.EncryptMegolmEvent(roomID, evtType, &content)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to encrypt event after re-sharing group session")
+			return nil, fmt.Errorf("failed to encrypt event after re-sharing group session: %w", err)
 		}
 	}
 	return encrypted, nil
@@ -187,6 +190,13 @@ func (helper *CryptoHelper) Encrypt(roomID id.RoomID, evtType event.Type, conten
 
 func (helper *CryptoHelper) WaitForSession(roomID id.RoomID, senderKey id.SenderKey, sessionID id.SessionID, timeout time.Duration) bool {
 	return helper.mach.WaitForSession(roomID, senderKey, sessionID, timeout)
+}
+
+func (helper *CryptoHelper) ResetSession(roomID id.RoomID) {
+	err := helper.mach.CryptoStore.RemoveOutboundGroupSession(roomID)
+	if err != nil {
+		helper.log.Debugfln("Error manually removing outbound group session in %s: %v", roomID, err)
+	}
 }
 
 func (helper *CryptoHelper) HandleMemberEvent(evt *event.Event) {
@@ -198,7 +208,23 @@ type cryptoSyncer struct {
 }
 
 func (syncer *cryptoSyncer) ProcessResponse(resp *mautrix.RespSync, since string) error {
-	syncer.ProcessSyncResponse(resp, since)
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				syncer.Log.Error("Processing sync response (%s) panicked: %v\n%s", since, err, debug.Stack())
+			}
+			done <- struct{}{}
+		}()
+		syncer.Log.Trace("Starting sync response handling (%s)", since)
+		syncer.ProcessSyncResponse(resp, since)
+		syncer.Log.Trace("Successfully handled sync response (%s)", since)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		syncer.Log.Warn("Handling sync response (%s) is taking unusually long", since)
+	}
 	return nil
 }
 
