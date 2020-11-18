@@ -55,10 +55,13 @@ type MetricsHandler struct {
 	unencryptedGroupCount   prometheus.Gauge
 	unencryptedPrivateCount prometheus.Gauge
 
-	connected      prometheus.Gauge
-	connectedState map[types.WhatsAppID]bool
-	loggedIn       prometheus.Gauge
-	loggedInState  map[types.WhatsAppID]bool
+	connected       prometheus.Gauge
+	connectedState  map[types.WhatsAppID]bool
+	loggedIn        prometheus.Gauge
+	loggedInState   map[types.WhatsAppID]bool
+	syncLocked      prometheus.Gauge
+	syncLockedState map[types.WhatsAppID]bool
+	bufferLength    *prometheus.GaugeVec
 }
 
 func NewMetricsHandler(address string, log log.Logger, db *database.Database) *MetricsHandler {
@@ -112,6 +115,15 @@ func NewMetricsHandler(address string, log log.Logger, db *database.Database) *M
 			Help: "Bridge users connected to WhatsApp",
 		}),
 		connectedState: make(map[types.WhatsAppID]bool),
+		syncLocked: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "bridge_sync_locked",
+			Help: "Bridge users locked in post-login sync",
+		}),
+		syncLockedState: make(map[types.WhatsAppID]bool),
+		bufferLength: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "bridge_buffer_size",
+			Help: "Number of messages in buffer",
+		}, []string{"user_id"}),
 	}
 }
 
@@ -165,6 +177,28 @@ func (mh *MetricsHandler) TrackConnectionState(jid types.WhatsAppID, connected b
 			mh.connected.Dec()
 		}
 	}
+}
+
+func (mh *MetricsHandler) TrackSyncLock(jid types.WhatsAppID, locked bool) {
+	if !mh.running {
+		return
+	}
+	currentVal, ok := mh.syncLockedState[jid]
+	if !ok || currentVal != locked {
+		mh.syncLockedState[jid] = locked
+		if locked {
+			mh.syncLocked.Inc()
+		} else {
+			mh.syncLocked.Dec()
+		}
+	}
+}
+
+func (mh *MetricsHandler) TrackBufferLength(id id.UserID, length int) {
+	if !mh.running {
+		return
+	}
+	mh.bufferLength.With(prometheus.Labels{"user_id": string(id)}).Set(float64(length))
 }
 
 func (mh *MetricsHandler) updateStats() {

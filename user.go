@@ -67,7 +67,8 @@ type User struct {
 	chatListReceived chan struct{}
 	syncPortalsDone  chan struct{}
 
-	messages chan PortalMessage
+	messageInput  chan PortalMessage
+	messageOutput chan PortalMessage
 
 	syncStart chan struct{}
 	syncWait  sync.WaitGroup
@@ -177,12 +178,14 @@ func (bridge *Bridge) NewUser(dbUser *database.User) *User {
 		chatListReceived: make(chan struct{}, 1),
 		syncPortalsDone:  make(chan struct{}, 1),
 		syncStart:        make(chan struct{}, 1),
-		messages:         make(chan PortalMessage, bridge.Config.Bridge.UserMessageBuffer),
+		messageInput:     make(chan PortalMessage),
+		messageOutput:    make(chan PortalMessage, bridge.Config.Bridge.UserMessageBuffer),
 	}
 	user.RelaybotWhitelisted = user.bridge.Config.Bridge.Permissions.IsRelaybotWhitelisted(user.MXID)
 	user.Whitelisted = user.bridge.Config.Bridge.Permissions.IsWhitelisted(user.MXID)
 	user.Admin = user.bridge.Config.Bridge.Permissions.IsAdmin(user.MXID)
 	go user.handleMessageLoop()
+	go user.runMessageRingBuffer()
 	return user
 }
 
@@ -413,6 +416,7 @@ func (cl ChatList) Swap(i, j int) {
 func (user *User) PostLogin() {
 	user.bridge.Metrics.TrackConnectionState(user.JID, true)
 	user.bridge.Metrics.TrackLoginState(user.JID, true)
+	user.bridge.Metrics.TrackBufferLength(user.MXID, 0)
 	user.log.Debugln("Locking processing of incoming messages and starting post-login sync")
 	user.syncWait.Add(1)
 	user.syncStart <- struct{}{}
@@ -427,9 +431,10 @@ func (user *User) tryAutomaticDoublePuppeting() {
 		// user is on another homeserver
 		return
 	}
-
+	user.log.Debugln("Checking if double puppeting needs to be enabled")
 	puppet := user.bridge.GetPuppetByJID(user.JID)
 	if len(puppet.CustomMXID) > 0 {
+		user.log.Debugln("User already has double-puppeting enabled")
 		// Custom puppet already enabled
 		return
 	}
@@ -464,6 +469,7 @@ func (user *User) sendMarkdownBridgeAlert(formatString string, args ...interface
 }
 
 func (user *User) postConnPing() bool {
+	user.log.Debugln("Making post-connection ping")
 	err := user.Conn.AdminTest()
 	if err != nil {
 		user.log.Errorfln("Post-connection ping failed: %v. Disconnecting and then reconnecting after a second", err)
@@ -491,6 +497,7 @@ func (user *User) intPostLogin() {
 	user.createCommunity()
 	user.tryAutomaticDoublePuppeting()
 
+	user.log.Debugln("Waiting for chat list receive confirmation")
 	select {
 	case <-user.chatListReceived:
 		user.log.Debugln("Chat list receive confirmation received in PostLogin")
@@ -499,12 +506,17 @@ func (user *User) intPostLogin() {
 		user.postConnPing()
 		return
 	}
+
 	if !user.postConnPing() {
+		user.log.Debugln("Post-connection ping failed, unlocking processing of incoming messages.")
 		return
 	}
+
+	user.log.Debugln("Waiting for portal sync complete confirmation")
 	select {
 	case <-user.syncPortalsDone:
-		user.log.Debugln("Post-login portal sync complete, unlocking processing of incoming messages.")
+		user.log.Debugln("Post-connection portal sync complete, unlocking processing of incoming messages.")
+	// TODO this is too short, maybe a per-portal duration?
 	case <-time.After(time.Duration(user.bridge.Config.Bridge.PortalSyncWait) * time.Second):
 		user.log.Warnln("Timed out waiting for portal sync to complete! Unlocking processing of incoming messages.")
 	}
@@ -784,22 +796,32 @@ func (user *User) GetPortalByJID(jid types.WhatsAppID) *Portal {
 	return user.bridge.GetPortalByJID(user.PortalKey(jid))
 }
 
-func (user *User) handleMessageLoop() {
-	for {
+func (user *User) runMessageRingBuffer() {
+	for msg := range user.messageInput {
 		select {
-		case msg := <-user.messages:
-			user.GetPortalByJID(msg.chat).messages <- msg
-		case <-user.syncStart:
-			user.syncWait.Wait()
+		case user.messageOutput <- msg:
+			user.bridge.Metrics.TrackBufferLength(user.MXID, len(user.messageOutput))
+		default:
+			dropped := <-user.messageOutput
+			user.log.Warnln("Buffer is full, dropping message in", dropped.chat)
+			user.messageOutput<-msg
 		}
 	}
 }
 
-func (user *User) putMessage(message PortalMessage) {
-	select {
-	case user.messages <- message:
-	default:
-		user.log.Warnln("Buffer is full, dropping message in", message.chat)
+func (user *User) handleMessageLoop() {
+	for {
+		select {
+		case msg := <-user.messageOutput:
+			user.bridge.Metrics.TrackBufferLength(user.MXID, len(user.messageOutput))
+			user.GetPortalByJID(msg.chat).messages <- msg
+		case <-user.syncStart:
+			user.log.Debugln("Processing of incoming messages is locked")
+			user.bridge.Metrics.TrackSyncLock(user.JID, true)
+			user.syncWait.Wait()
+			user.bridge.Metrics.TrackSyncLock(user.JID, false)
+			user.log.Debugln("Processing of incoming messages unlocked")
+		}
 	}
 }
 
@@ -832,39 +854,39 @@ func (user *User) HandleBatteryMessage(battery whatsapp.BatteryMessage) {
 }
 
 func (user *User) HandleTextMessage(message whatsapp.TextMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleImageMessage(message whatsapp.ImageMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleStickerMessage(message whatsapp.StickerMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleVideoMessage(message whatsapp.VideoMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleAudioMessage(message whatsapp.AudioMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleDocumentMessage(message whatsapp.DocumentMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleContactMessage(message whatsapp.ContactMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleLocationMessage(message whatsapp.LocationMessage) {
-	user.putMessage(PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp})
+	user.messageInput <- PortalMessage{message.Info.RemoteJid, user, message, message.Info.Timestamp}
 }
 
 func (user *User) HandleMessageRevoke(message whatsappExt.MessageRevocation) {
-	user.putMessage(PortalMessage{message.RemoteJid, user, message, 0})
+	user.messageInput <- PortalMessage{message.RemoteJid, user, message, 0}
 }
 
 type FakeMessage struct {
