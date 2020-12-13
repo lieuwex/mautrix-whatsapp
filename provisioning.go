@@ -53,7 +53,18 @@ func (prov *ProvisioningAPI) Init() {
 func (prov *ProvisioningAPI) AuthMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		auth = auth[len("Bearer "):]
+		if len(auth) == 0 && strings.HasSuffix(r.URL.Path, "/login") {
+			authParts := strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",")
+			for _, part := range authParts {
+				part = strings.TrimSpace(part)
+				if strings.HasPrefix(part, "net.maunium.whatsapp.auth-") {
+					auth = part[len("net.maunium.whatsapp.auth-"):]
+					break
+				}
+			}
+		} else if strings.HasPrefix(auth, "Bearer ") {
+			auth = auth[len("Bearer "):]
+		}
 		if auth != prov.bridge.Config.AppService.Provisioning.SharedSecret {
 			jsonResponse(w, http.StatusForbidden, map[string]interface{}{
 				"error":   "Invalid auth token",
@@ -92,6 +103,7 @@ func (prov *ProvisioningAPI) DeleteSession(w http.ResponseWriter, r *http.Reques
 		_, _ = user.Conn.Disconnect()
 		user.Conn.RemoveHandlers()
 		user.Conn = nil
+		user.bridge.Metrics.TrackConnectionState(user.JID, false)
 	}
 	jsonResponse(w, http.StatusOK, Response{true, "Session information purged"})
 }
@@ -281,29 +293,50 @@ func (prov *ProvisioningAPI) Logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := user.Conn.Logout()
-	if err != nil {
-		user.log.Warnln("Error while logging out:", err)
-		jsonResponse(w, http.StatusInternalServerError, Error{
-			Error:   fmt.Sprintf("Unknown error while logging out: %v", err),
-			ErrCode: err.Error(),
-		})
-		return
+	force := strings.ToLower(r.URL.Query().Get("force")) != "false"
+
+	if user.Conn == nil {
+		if !force {
+			jsonResponse(w, http.StatusNotFound, Error{
+				Error:   "You're not connected",
+				ErrCode: "not connected",
+			})
+		}
+	} else {
+		err := user.Conn.Logout()
+		if err != nil {
+			user.log.Warnln("Error while logging out:", err)
+			if !force {
+				jsonResponse(w, http.StatusInternalServerError, Error{
+					Error:   fmt.Sprintf("Unknown error while logging out: %v", err),
+					ErrCode: err.Error(),
+				})
+				return
+			}
+		}
+		_, err = user.Conn.Disconnect()
+		if err != nil {
+			user.log.Warnln("Error while disconnecting after logout:", err)
+		}
+		user.Conn.RemoveHandlers()
+		user.Conn = nil
 	}
-	_, err = user.Conn.Disconnect()
-	if err != nil {
-		user.log.Warnln("Error while disconnecting after logout:", err)
-	}
-	user.Conn.RemoveHandlers()
-	user.Conn = nil
+
+	user.bridge.Metrics.TrackConnectionState(user.JID, false)
 	user.removeFromJIDMap()
+
 	// TODO this causes a foreign key violation, which should be fixed
 	//ce.User.JID = ""
 	user.SetSession(nil)
 	jsonResponse(w, http.StatusOK, Response{true, "Logged out successfully."})
 }
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+	Subprotocols: []string{"net.maunium.whatsapp.login"},
+}
 
 func (prov *ProvisioningAPI) Login(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("user_id")
