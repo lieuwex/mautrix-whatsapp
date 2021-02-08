@@ -82,7 +82,8 @@ bridge:
     # (Note that, by default, non-admins might not have your homeserver's permission to create
     #  communities.)
     # {{.Localpart}} is the MXID localpart and {{.Server}} is the MXID server part of the user.
-    community_template: whatsapp_{{.Localpart}}={{.Server}}
+    # whatsapp_{{.Localpart}}={{.Server}} is a good value that should work for any user.
+    community_template: null
 
     # WhatsApp connection timeout in seconds.
     connection_timeout: 20
@@ -105,6 +106,8 @@ bridge:
     # Whether or not the bridge should send a notice to the user's management room when it retries connecting.
     # If false, it will only report when it stops retrying.
     report_connection_retry: true
+    # Whether or not the bridge should reconnect even if WhatsApp says another web client connected.
+    aggressive_reconnect: false
     # Maximum number of seconds to wait for chats to be sent at startup.
     # If this is too low and you have lots of chats, it could cause backfilling to fail.
     chat_list_wait: 30

@@ -80,6 +80,9 @@ func (ce *CommandEvent) Reply(msg string, args ...interface{}) {
 // Handle handles messages to the bridge
 func (handler *CommandHandler) Handle(roomID id.RoomID, user *User, message string) {
 	args := strings.Fields(message)
+	if len(args) == 0 {
+		args = []string{"unknown-command"}
+	}
 	ce := &CommandEvent{
 		Bot:     handler.bridge.Bot,
 		Bridge:  handler.bridge,
@@ -162,7 +165,7 @@ func (handler *CommandHandler) CommandMux(ce *CommandEvent) {
 			handler.CommandCreate(ce)
 		}
 	default:
-		ce.Reply("Unknown Command")
+		ce.Reply("Unknown command, use the `help` command for help.")
 	}
 }
 
@@ -409,12 +412,7 @@ func (handler *CommandHandler) CommandLogout(ce *CommandEvent) {
 		ce.Reply("Unknown error while logging out: %v", err)
 		return
 	}
-	_, err = ce.User.Conn.Disconnect()
-	if err != nil {
-		ce.User.log.Warnln("Error while disconnecting after logout:", err)
-	}
-	ce.User.Conn.RemoveHandlers()
-	ce.User.Conn = nil
+	ce.User.Disconnect()
 	ce.User.removeFromJIDMap()
 	// TODO this causes a foreign key violation, which should be fixed
 	//ce.User.JID = ""
@@ -472,13 +470,9 @@ func (handler *CommandHandler) CommandDeleteSession(ce *CommandEvent) {
 		ce.Reply("Nothing to purge: no session information stored and no active connection.")
 		return
 	}
+	ce.User.Disconnect()
 	ce.User.removeFromJIDMap()
 	ce.User.SetSession(nil)
-	if ce.User.Conn != nil {
-		_, _ = ce.User.Conn.Disconnect()
-		ce.User.Conn.RemoveHandlers()
-		ce.User.Conn = nil
-	}
 	ce.Reply("Session information purged")
 }
 
@@ -501,7 +495,7 @@ func (handler *CommandHandler) CommandReconnect(ce *CommandEvent) {
 		wasConnected = false
 	} else if err != nil {
 		ce.User.log.Warnln("Error while disconnecting:", err)
-	} else if len(sess.Wid) > 0 {
+	} else {
 		ce.User.SetSession(&sess)
 	}
 
@@ -527,16 +521,16 @@ func (handler *CommandHandler) CommandReconnect(ce *CommandEvent) {
 	}
 	if err != nil {
 		ce.User.log.Warnln("Error while reconnecting:", err)
-		if err.Error() == "restore session connection timed out" {
+		if errors.Is(err, whatsapp.ErrRestoreSessionTimeout) {
 			ce.Reply("Reconnection timed out. Is WhatsApp on your phone reachable?")
 		} else {
 			ce.Reply("Unknown error while reconnecting: %v", err)
 		}
 		ce.User.log.Debugln("Disconnecting due to failed session restore in reconnect command...")
-		sess, err := ce.User.Conn.Disconnect()
+		sess, err = ce.User.Conn.Disconnect()
 		if err != nil {
 			ce.User.log.Errorln("Failed to disconnect after failed session restore in reconnect command:", err)
-		} else if len(sess.Wid) > 0 {
+		} else {
 			ce.User.SetSession(&sess)
 		}
 		return
@@ -560,13 +554,7 @@ func (handler *CommandHandler) CommandDeleteConnection(ce *CommandEvent) {
 		ce.Reply("You don't have a WhatsApp connection.")
 		return
 	}
-	sess, err := ce.User.Conn.Disconnect()
-	if err == nil && len(sess.Wid) > 0 {
-		ce.User.SetSession(&sess)
-	}
-	ce.User.Conn.RemoveHandlers()
-	ce.User.Conn = nil
-	ce.User.bridge.Metrics.TrackConnectionState(ce.User.JID, false)
+	ce.User.Disconnect()
 	ce.Reply("Successfully disconnected. Use the `reconnect` command to reconnect.")
 }
 
@@ -585,7 +573,7 @@ func (handler *CommandHandler) CommandDisconnect(ce *CommandEvent) {
 		ce.User.log.Warnln("Error while disconnecting:", err)
 		ce.Reply("Unknown error while disconnecting: %v", err)
 		return
-	} else if len(sess.Wid) > 0 {
+	} else {
 		ce.User.SetSession(&sess)
 	}
 	ce.User.bridge.Metrics.TrackConnectionState(ce.User.JID, false)
