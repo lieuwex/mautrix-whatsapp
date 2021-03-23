@@ -196,7 +196,10 @@ func (portal *Portal) handleMessageLoop() {
 	for msg := range portal.messages {
 		if len(portal.MXID) == 0 {
 			if msg.timestamp+MaxMessageAgeToCreatePortal < uint64(time.Now().Unix()) {
-				portal.log.Debugln("Not creating portal room for incoming message as the message is too old.")
+				portal.log.Debugln("Not creating portal room for incoming message: message is too old")
+				continue
+			} else if !portal.shouldCreateRoom(msg) {
+				portal.log.Debugln("Not creating portal room for incoming message: message is not a chat message")
 				continue
 			}
 			portal.log.Debugln("Creating Matrix room from incoming message")
@@ -210,6 +213,16 @@ func (portal *Portal) handleMessageLoop() {
 		portal.handleMessage(msg, false)
 		portal.backfillLock.Unlock()
 	}
+}
+
+func (portal *Portal) shouldCreateRoom(msg PortalMessage) bool {
+	stubMsg, ok := msg.data.(whatsapp.StubMessage)
+	if ok {
+		// This could be more specific: if someone else was added, we might not care,
+		// but if the local user was added, we definitely care.
+		return stubMsg.Type == waProto.WebMessageInfo_GROUP_PARTICIPANT_ADD || stubMsg.Type == waProto.WebMessageInfo_GROUP_PARTICIPANT_INVITE
+	}
+	return true
 }
 
 func (portal *Portal) handleMessage(msg PortalMessage, isBackfill bool) {
@@ -383,12 +396,13 @@ func (portal *Portal) kickExtraUsers(participantMap map[whatsapp.JID]bool) {
 	}
 }
 
-func (portal *Portal) SyncBroadcastRecipients(metadata *whatsapp.BroadcastListInfo) {
+func (portal *Portal) SyncBroadcastRecipients(source *User, metadata *whatsapp.BroadcastListInfo) {
 	participantMap := make(map[whatsapp.JID]bool)
 	for _, recipient := range metadata.Recipients {
 		participantMap[recipient.JID] = true
 
 		puppet := portal.bridge.GetPuppetByJID(recipient.JID)
+		puppet.SyncContactIfNecessary(source)
 		err := puppet.DefaultIntent().EnsureJoined(portal.MXID)
 		if err != nil {
 			portal.log.Warnfln("Failed to make puppet of %s join %s: %v", recipient.JID, portal.MXID, err)
@@ -397,7 +411,7 @@ func (portal *Portal) SyncBroadcastRecipients(metadata *whatsapp.BroadcastListIn
 	portal.kickExtraUsers(participantMap)
 }
 
-func (portal *Portal) SyncParticipants(metadata *whatsapp.GroupInfo) {
+func (portal *Portal) SyncParticipants(source *User, metadata *whatsapp.GroupInfo) {
 	changed := false
 	levels, err := portal.MainIntent().PowerLevels(portal.MXID)
 	if err != nil {
@@ -411,7 +425,8 @@ func (portal *Portal) SyncParticipants(metadata *whatsapp.GroupInfo) {
 		portal.userMXIDAction(user, portal.ensureMXIDInvited)
 
 		puppet := portal.bridge.GetPuppetByJID(participant.JID)
-		err := puppet.IntentFor(portal).EnsureJoined(portal.MXID)
+		puppet.SyncContactIfNecessary(source)
+		err = puppet.IntentFor(portal).EnsureJoined(portal.MXID)
 		if err != nil {
 			portal.log.Warnfln("Failed to make puppet of %s join %s: %v", participant.JID, portal.MXID, err)
 		}
@@ -550,7 +565,7 @@ func (portal *Portal) UpdateMetadata(user *User) bool {
 		update := false
 		broadcastMetadata, err := user.Conn.GetBroadcastMetadata(portal.Key.JID)
 		if err == nil && broadcastMetadata.Status == 200 {
-			portal.SyncBroadcastRecipients(broadcastMetadata)
+			portal.SyncBroadcastRecipients(user, broadcastMetadata)
 			update = portal.UpdateName(broadcastMetadata.Name, "", nil, false) || update
 		} else {
 			contact, _ := user.Conn.Store.Contacts[portal.Key.JID]
@@ -574,7 +589,7 @@ func (portal *Portal) UpdateMetadata(user *User) bool {
 		return false
 	}
 
-	portal.SyncParticipants(metadata)
+	portal.SyncParticipants(user, metadata)
 	update := false
 	update = portal.UpdateName(metadata.Name, metadata.NameSetBy, nil, false) || update
 	update = portal.UpdateTopic(metadata.Topic, metadata.TopicSetBy, nil, false) || update
@@ -1016,6 +1031,7 @@ func (portal *Portal) CreateMatrixRoom(user *User) error {
 	var broadcastMetadata *whatsapp.BroadcastListInfo
 	if portal.IsPrivateChat() {
 		puppet := portal.bridge.GetPuppetByJID(portal.Key.JID)
+		puppet.SyncContactIfNecessary(user)
 		if portal.bridge.Config.Bridge.PrivateChatPortalMeta {
 			portal.Name = puppet.Displayname
 			portal.AvatarURL = puppet.AvatarURL
@@ -1118,7 +1134,7 @@ func (portal *Portal) CreateMatrixRoom(user *User) error {
 	}
 
 	if metadata != nil {
-		portal.SyncParticipants(metadata)
+		portal.SyncParticipants(user, metadata)
 		if metadata.Announce {
 			portal.RestrictMessageSending(metadata.Announce)
 		}
@@ -1129,7 +1145,7 @@ func (portal *Portal) CreateMatrixRoom(user *User) error {
 		}
 	}
 	if broadcastMetadata != nil {
-		portal.SyncBroadcastRecipients(broadcastMetadata)
+		portal.SyncBroadcastRecipients(user, broadcastMetadata)
 	}
 	inCommunity := user.addPortalToCommunity(portal)
 	if portal.IsPrivateChat() && !user.IsRelaybot {

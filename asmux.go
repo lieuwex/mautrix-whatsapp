@@ -57,11 +57,11 @@ type AsmuxPong struct {
 func (pong *AsmuxPong) fill() {
 	pong.Timestamp = time.Now().Unix()
 	if !pong.OK {
-		pong.TTL = 300
+		pong.TTL = 60
 		pong.ErrorSource = "bridge"
 		pong.Message = asmuxHumanErrors[pong.Error]
 	} else {
-		pong.TTL = 1800
+		pong.TTL = 240
 	}
 }
 
@@ -69,7 +69,7 @@ func (pong *AsmuxPong) shouldDeduplicate(newPong *AsmuxPong) bool {
 	if pong == nil || pong.OK != newPong.OK || pong.Error != newPong.Error {
 		return false
 	}
-	return pong.Timestamp+int64(pong.TTL/10) > time.Now().Unix()
+	return pong.Timestamp+int64(pong.TTL/5) > time.Now().Unix()
 }
 
 func (user *User) setupAdminTestHooks() {
@@ -133,7 +133,6 @@ func (prov *ProvisioningAPI) AsmuxPing(w http.ResponseWriter, r *http.Request) {
 				go user.HandleError(err)
 				resp.Error = AsmuxWAPingFalse
 			} else if errors.Is(err, whatsapp.ErrConnectionTimeout) {
-				user.Conn.CountTimeout()
 				resp.Error = AsmuxWATimeout
 			} else if err != nil {
 				resp.Error = AsmuxWAPingError
