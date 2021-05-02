@@ -23,13 +23,15 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/skip2/go-qrcode"
 	log "maunium.net/go/maulogger/v2"
+	"maunium.net/go/mautrix/appservice"
+	"maunium.net/go/mautrix/pushrules"
 
 	"github.com/Rhymen/go-whatsapp"
 	waBinary "github.com/Rhymen/go-whatsapp/binary"
@@ -72,6 +74,7 @@ type User struct {
 
 	syncStart chan struct{}
 	syncWait  sync.WaitGroup
+	syncing   int32
 
 	mgmtCreateLock  sync.Mutex
 	connLock        sync.Mutex
@@ -438,10 +441,9 @@ func (user *User) Login(ce *CommandEvent) {
 }
 
 type Chat struct {
-	Portal          *Portal
-	LastMessageTime uint64
-	MarkAsRead      bool
-	Contact         whatsapp.Contact
+	whatsapp.Chat
+	Portal  *Portal
+	Contact whatsapp.Contact
 }
 
 type ChatList []Chat
@@ -462,10 +464,13 @@ func (user *User) PostLogin() {
 	user.sendBridgeStatus(AsmuxPong{OK: true})
 	user.bridge.Metrics.TrackConnectionState(user.JID, true)
 	user.bridge.Metrics.TrackLoginState(user.JID, true)
-	user.bridge.Metrics.TrackBufferLength(user.MXID, 0)
+	user.bridge.Metrics.TrackBufferLength(user.MXID, len(user.messageOutput))
+	if !atomic.CompareAndSwapInt32(&user.syncing, 0, 1) {
+		// TODO we should cleanly stop the old sync and start a new one instead of not starting a new one
+		user.log.Warnln("There seems to be a post-sync already in progress, not starting a new one")
+		return
+	}
 	user.log.Debugln("Locking processing of incoming messages and starting post-login sync")
-	// TODO can an old sync still be ongoing when PostLogin is called again?
-	// TODO 2: can the new sync happen before this happens?
 	user.chatListReceived = make(chan struct{}, 1)
 	user.syncPortalsDone = make(chan struct{}, 1)
 	user.syncWait.Add(1)
@@ -543,6 +548,7 @@ func (user *User) postConnPing() bool {
 }
 
 func (user *User) intPostLogin() {
+	defer atomic.StoreInt32(&user.syncing, 0)
 	defer user.syncWait.Done()
 	user.lastReconnection = time.Now().Unix()
 	user.createCommunity()
@@ -612,6 +618,21 @@ func (user *User) HandleEvent(event interface{}) {
 		user.HandleChatUpdate(v)
 	case whatsapp.ConnInfo:
 		user.HandleConnInfo(v)
+	case whatsapp.MuteMessage:
+		portal := user.bridge.GetPortalByJID(user.PortalKey(v.JID))
+		if portal != nil {
+			go user.updateChatMute(nil, portal, v.MutedUntil)
+		}
+	case whatsapp.ArchiveMessage:
+		portal := user.bridge.GetPortalByJID(user.PortalKey(v.JID))
+		if portal != nil {
+			go user.updateChatTag(nil, portal, user.bridge.Config.Bridge.ArchiveTag, v.IsArchived)
+		}
+	case whatsapp.PinMessage:
+		portal := user.bridge.GetPortalByJID(user.PortalKey(v.JID))
+		if portal != nil {
+			go user.updateChatTag(nil, portal, user.bridge.Config.Bridge.PinnedTag, v.IsPinned)
+		}
 	case json.RawMessage:
 		user.HandleJSONMessage(v)
 	case *waProto.WebMessageInfo:
@@ -658,9 +679,104 @@ func (user *User) HandleChatList(chats []whatsapp.Chat) {
 	go user.syncPortals(chatMap, false)
 }
 
-func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) {
-	// TODO use contexts instead of checking if user.Conn is the same?
-	connAtStart := user.Conn
+func (user *User) updateChatMute(intent *appservice.IntentAPI, portal *Portal, mutedUntil int64) {
+	if len(portal.MXID) == 0 || !user.bridge.Config.Bridge.MuteBridging {
+		return
+	} else if intent == nil {
+		doublePuppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
+		if doublePuppet == nil || doublePuppet.CustomIntent() == nil {
+			return
+		}
+		intent = doublePuppet.CustomIntent()
+	}
+	var err error
+	if mutedUntil < time.Now().Unix() {
+		user.log.Debugln("Unmuting", portal.MXID)
+		err = intent.DeletePushRule("global", pushrules.RoomRule, string(portal.MXID))
+	} else {
+		user.log.Debugln("Muting", portal.MXID)
+		err = intent.PutPushRule("global", pushrules.RoomRule, string(portal.MXID), &mautrix.ReqPutPushRule{
+			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+		})
+	}
+	if err != nil && !errors.Is(err, mautrix.MNotFound) {
+		user.log.Warnfln("Failed to update push rule for %s through double puppet: %v", portal.MXID, err)
+	}
+}
+
+type CustomTagData struct {
+	Order        json.Number `json:"order"`
+	DoublePuppet bool        `json:"net.maunium.whatsapp.puppet"`
+}
+
+type CustomTagEventContent struct {
+	Tags map[string]CustomTagData `json:"tags"`
+}
+
+func (user *User) updateChatTag(intent *appservice.IntentAPI, portal *Portal, tag string, active bool) {
+	if len(portal.MXID) == 0 || len(tag) == 0 {
+		return
+	} else if intent == nil {
+		doublePuppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
+		if doublePuppet == nil || doublePuppet.CustomIntent() == nil {
+			return
+		}
+		intent = doublePuppet.CustomIntent()
+	}
+	var existingTags CustomTagEventContent
+	err := intent.GetTagsWithCustomData(portal.MXID, &existingTags)
+	if err != nil && !errors.Is(err, mautrix.MNotFound) {
+		user.log.Warnfln("Failed to get tags of %s: %v", portal.MXID, err)
+	}
+	currentTag, ok := existingTags.Tags[tag]
+	if active && !ok {
+		user.log.Debugln("Adding tag", tag, "to", portal.MXID)
+		data := CustomTagData{"0.5", true}
+		err = intent.AddTagWithCustomData(portal.MXID, tag, &data)
+	} else if !active && ok && currentTag.DoublePuppet {
+		user.log.Debugln("Removing tag", tag, "from", portal.MXID)
+		err = intent.RemoveTag(portal.MXID, tag)
+	} else {
+		err = nil
+	}
+	if err != nil {
+		user.log.Warnfln("Failed to update tag %s for %s through double puppet: %v", tag, portal.MXID, err)
+	}
+}
+
+func (user *User) syncChatDoublePuppetDetails(doublePuppet *Puppet, chat Chat, justCreated bool) {
+	if doublePuppet == nil || doublePuppet.CustomIntent() == nil {
+		return
+	}
+	intent := doublePuppet.CustomIntent()
+	if chat.UnreadCount == 0 {
+		lastMessage := user.bridge.DB.Message.GetLastInChat(chat.Portal.Key)
+		if lastMessage != nil {
+			err := intent.MarkRead(chat.Portal.MXID, lastMessage.MXID)
+			if err != nil {
+				user.log.Warnln("Failed to mark %s in %s as read after backfill: %v", lastMessage.MXID, chat.Portal.MXID, err)
+			}
+		}
+	}
+	if justCreated || !user.bridge.Config.Bridge.TagOnlyOnCreate {
+		user.updateChatMute(intent, chat.Portal, chat.MutedUntil)
+		user.updateChatTag(intent, chat.Portal, user.bridge.Config.Bridge.ArchiveTag, chat.IsArchived)
+		user.updateChatTag(intent, chat.Portal, user.bridge.Config.Bridge.PinnedTag, chat.IsPinned)
+	}
+}
+
+func (user *User) syncPortal(chat Chat) {
+	// Don't sync unless chat meta sync is enabled or portal doesn't exist
+	if user.bridge.Config.Bridge.ChatMetaSync || len(chat.Portal.MXID) == 0 {
+		chat.Portal.Sync(user, chat.Contact)
+	}
+	err := chat.Portal.BackfillHistory(user, chat.LastMessageTime)
+	if err != nil {
+		chat.Portal.log.Errorln("Error backfilling history:", err)
+	}
+}
+
+func (user *User) collectChatList(chatMap map[string]whatsapp.Chat) ChatList {
 	if chatMap == nil {
 		chatMap = user.Conn.Store.Chats
 	}
@@ -669,18 +785,12 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 	existingKeys := user.GetInCommunityMap()
 	portalKeys := make([]database.PortalKeyWithMeta, 0, len(chatMap))
 	for _, chat := range chatMap {
-		ts, err := strconv.ParseUint(chat.LastMessageTime, 10, 64)
-		if err != nil {
-			user.log.Warnfln("Non-integer last message time in %s: %s", chat.JID, chat.LastMessageTime)
-			continue
-		}
 		portal := user.GetPortalByJID(chat.JID)
 
 		chats = append(chats, Chat{
-			Portal:          portal,
-			Contact:         user.Conn.Store.Contacts[chat.JID],
-			LastMessageTime: ts,
-			MarkAsRead:      chat.Unread == "0",
+			Chat:    chat,
+			Portal:  portal,
+			Contact: user.Conn.Store.Contacts[chat.JID],
 		})
 		var inCommunity, ok bool
 		if inCommunity, ok = existingKeys[portal.Key]; !ok || !inCommunity {
@@ -698,6 +808,15 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 		user.log.Warnln("Failed to update user-portal mapping:", err)
 	}
 	sort.Sort(chats)
+	return chats
+}
+
+func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) {
+	// TODO use contexts instead of checking if user.Conn is the same?
+	connAtStart := user.Conn
+
+	chats := user.collectChatList(chatMap)
+
 	limit := user.bridge.Config.Bridge.InitialChatSync
 	if limit < 0 {
 		limit = len(chats)
@@ -706,7 +825,7 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 		user.log.Debugln("Connection seems to have changed before sync, cancelling")
 		return
 	}
-	now := uint64(time.Now().Unix())
+	now := time.Now().Unix()
 	user.log.Infoln("Syncing portals")
 	doublePuppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
 	for i, chat := range chats {
@@ -715,23 +834,9 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 		}
 		create := (chat.LastMessageTime >= user.LastConnection && user.LastConnection > 0) || i < limit
 		if len(chat.Portal.MXID) > 0 || create || createAll {
-			// Don't sync unless chat meta sync is enabled or portal doesn't exist
-			if user.bridge.Config.Bridge.ChatMetaSync || len(chat.Portal.MXID) == 0 {
-				chat.Portal.Sync(user, chat.Contact)
-			}
-			err = chat.Portal.BackfillHistory(user, chat.LastMessageTime)
-			if err != nil {
-				chat.Portal.log.Errorln("Error backfilling history:", err)
-			}
-			if chat.MarkAsRead && doublePuppet != nil && doublePuppet.CustomIntent() != nil {
-				lastMessage := user.bridge.DB.Message.GetLastInChat(chat.Portal.Key)
-				if lastMessage != nil {
-					err = doublePuppet.CustomIntent().MarkRead(chat.Portal.MXID, lastMessage.MXID)
-					if err != nil {
-						user.log.Warnln("Failed to mark %s in %s as read after backfill: %v", lastMessage.MXID, chat.Portal.MXID, err)
-					}
-				}
-			}
+			justCreated := len(chat.Portal.MXID) == 0
+			user.syncPortal(chat)
+			user.syncChatDoublePuppetDetails(doublePuppet, chat, justCreated)
 		}
 	}
 	if user.Conn != connAtStart {
@@ -739,6 +844,7 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 		return
 	}
 	user.UpdateDirectChats(nil)
+
 	user.log.Infoln("Finished syncing portals")
 	select {
 	case user.syncPortalsDone <- struct{}{}:
@@ -840,7 +946,7 @@ func (user *User) syncPuppets(contacts map[whatsapp.JID]whatsapp.Contact) {
 }
 
 func (user *User) updateLastConnectionIfNecessary() {
-	if user.LastConnection+60 < uint64(time.Now().Unix()) {
+	if user.LastConnection+60 < time.Now().Unix() {
 		user.UpdateLastConnection()
 	}
 }

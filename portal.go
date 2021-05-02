@@ -192,6 +192,22 @@ type Portal struct {
 
 const MaxMessageAgeToCreatePortal = 5 * 60 // 5 minutes
 
+func (portal *Portal) syncDoublePuppetDetailsAfterCreate(source *User) {
+	doublePuppet := portal.bridge.GetPuppetByCustomMXID(source.MXID)
+	if doublePuppet == nil {
+		return
+	}
+	chat, ok := source.Conn.Store.Chats[portal.Key.JID]
+	if !ok {
+		portal.log.Debugln("Not syncing chat mute/tags with %s: chat info not found", source.MXID)
+		return
+	}
+	source.syncChatDoublePuppetDetails(doublePuppet, Chat{
+		Chat:    chat,
+		Portal:  portal,
+	}, true)
+}
+
 func (portal *Portal) handleMessageLoop() {
 	for msg := range portal.messages {
 		if len(portal.MXID) == 0 {
@@ -208,6 +224,7 @@ func (portal *Portal) handleMessageLoop() {
 				portal.log.Errorln("Failed to create portal room:", err)
 				return
 			}
+			portal.syncDoublePuppetDetailsAfterCreate(msg.source)
 		}
 		portal.backfillLock.Lock()
 		portal.handleMessage(msg, false)
@@ -308,7 +325,7 @@ func (portal *Portal) markHandled(source *User, message *waProto.WebMessageInfo,
 	msg.Chat = portal.Key
 	msg.JID = message.GetKey().GetId()
 	msg.MXID = mxid
-	msg.Timestamp = message.GetMessageTimestamp()
+	msg.Timestamp = int64(message.GetMessageTimestamp())
 	if message.GetKey().GetFromMe() {
 		msg.Sender = source.JID
 	} else if portal.IsPrivateChat() {
@@ -765,7 +782,7 @@ func (portal *Portal) RestrictMetadataChanges(restrict bool) id.EventID {
 	return ""
 }
 
-func (portal *Portal) BackfillHistory(user *User, lastMessageTime uint64) error {
+func (portal *Portal) BackfillHistory(user *User, lastMessageTime int64) error {
 	if !portal.bridge.Config.Bridge.RecoverHistory {
 		return nil
 	}
@@ -893,8 +910,9 @@ func (portal *Portal) FillInitialHistory(user *User) error {
 	var messages []interface{}
 	before := ""
 	fromMe := true
-	chunkNum := 1
+	chunkNum := 0
 	for n > 0 {
+		chunkNum += 1
 		count := 50
 		if n < count {
 			count = n
@@ -1292,35 +1310,7 @@ func (portal *Portal) sendMainIntentMessage(content interface{}) (*mautrix.RespS
 	return portal.sendMessage(portal.MainIntent(), event.EventMessage, content, 0)
 }
 
-const MessageSendRetries = 5
-const MediaUploadRetries = 5
-const BadGatewaySleep = 5 * time.Second
-
 func (portal *Portal) sendMessage(intent *appservice.IntentAPI, eventType event.Type, content interface{}, timestamp int64) (*mautrix.RespSendEvent, error) {
-	return portal.sendMessageWithRetry(intent, eventType, content, timestamp, MessageSendRetries)
-}
-
-func isGatewayError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var httpErr mautrix.HTTPError
-	return errors.As(err, &httpErr) && (httpErr.IsStatus(http.StatusBadGateway) || httpErr.IsStatus(http.StatusGatewayTimeout))
-}
-
-func (portal *Portal) sendMessageWithRetry(intent *appservice.IntentAPI, eventType event.Type, content interface{}, timestamp int64, retries int) (*mautrix.RespSendEvent, error) {
-	for ; ; retries-- {
-		resp, err := portal.sendMessageDirect(intent, eventType, content, timestamp)
-		if retries > 0 && isGatewayError(err) {
-			portal.log.Warnfln("Got gateway error trying to send message, retrying in %d seconds", int(BadGatewaySleep.Seconds()))
-			time.Sleep(BadGatewaySleep)
-		} else {
-			return resp, err
-		}
-	}
-}
-
-func (portal *Portal) sendMessageDirect(intent *appservice.IntentAPI, eventType event.Type, content interface{}, timestamp int64) (*mautrix.RespSendEvent, error) {
 	wrappedContent := event.Content{Parsed: content}
 	if timestamp != 0 && intent.IsCustomPuppet {
 		wrappedContent.Raw = map[string]interface{}{
@@ -1650,18 +1640,6 @@ type mediaMessage struct {
 	sendAsSticker bool
 }
 
-func (portal *Portal) uploadWithRetry(intent *appservice.IntentAPI, data []byte, mimeType string, retries int) (*mautrix.RespMediaUpload, error) {
-	for ; ; retries-- {
-		uploaded, err := intent.UploadBytes(data, mimeType)
-		if isGatewayError(err) {
-			portal.log.Warnfln("Got gateway error trying to upload media, retrying in %d seconds", int(BadGatewaySleep.Seconds()))
-			time.Sleep(BadGatewaySleep)
-		} else {
-			return uploaded, err
-		}
-	}
-}
-
 func (portal *Portal) HandleMediaMessage(source *User, msg mediaMessage) {
 	intent := portal.startHandling(source, msg.info)
 	if intent == nil {
@@ -1694,7 +1672,7 @@ func (portal *Portal) HandleMediaMessage(source *User, msg mediaMessage) {
 
 	data, uploadMimeType, file := portal.encryptFile(data, msg.mimeType)
 
-	uploaded, err := portal.uploadWithRetry(intent, data, uploadMimeType, MediaUploadRetries)
+	uploaded, err := intent.UploadBytes(data, uploadMimeType)
 	if err != nil {
 		if errors.Is(err, mautrix.MTooLarge) {
 			portal.sendMediaBridgeFailure(source, intent, msg.info, errors.New("homeserver rejected too large file"))
@@ -2385,8 +2363,8 @@ func (portal *Portal) HandleMatrixLeave(sender *User) {
 			return
 		}
 		portal.log.Infoln("Leave response:", <-resp)
-		portal.CleanupIfEmpty()
 	}
+	portal.CleanupIfEmpty()
 }
 
 func (portal *Portal) HandleMatrixKick(sender *User, evt *event.Event) {
