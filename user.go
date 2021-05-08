@@ -633,7 +633,7 @@ func (user *User) HandleEvent(event interface{}) {
 		if portal != nil {
 			go user.updateChatTag(nil, portal, user.bridge.Config.Bridge.PinnedTag, v.IsPinned)
 		}
-	case json.RawMessage:
+	case whatsapp.RawJSONMessage:
 		user.HandleJSONMessage(v)
 	case *waProto.WebMessageInfo:
 		user.updateLastConnectionIfNecessary()
@@ -690,11 +690,11 @@ func (user *User) updateChatMute(intent *appservice.IntentAPI, portal *Portal, m
 		intent = doublePuppet.CustomIntent()
 	}
 	var err error
-	if mutedUntil < time.Now().Unix() {
-		user.log.Debugln("Unmuting", portal.MXID)
+	if mutedUntil != -1 && mutedUntil < time.Now().Unix() {
+		user.log.Debugfln("Portal %s is muted until %d, unmuting...", portal.MXID, mutedUntil)
 		err = intent.DeletePushRule("global", pushrules.RoomRule, string(portal.MXID))
 	} else {
-		user.log.Debugln("Muting", portal.MXID)
+		user.log.Debugfln("Portal %s is muted until %d, muting...", portal.MXID, mutedUntil)
 		err = intent.PutPushRule("global", pushrules.RoomRule, string(portal.MXID), &mautrix.ReqPutPushRule{
 			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
 		})
@@ -834,6 +834,7 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 		}
 		create := (chat.LastMessageTime >= user.LastConnection && user.LastConnection > 0) || i < limit
 		if len(chat.Portal.MXID) > 0 || create || createAll {
+			user.log.Debugfln("Syncing chat %+v", chat.Chat.Source)
 			justCreated := len(chat.Portal.MXID) == 0
 			user.syncPortal(chat)
 			user.syncChatDoublePuppetDetails(doublePuppet, chat, justCreated)
@@ -1379,11 +1380,11 @@ func (user *User) HandleConnInfo(info whatsapp.ConnInfo) {
 	}
 }
 
-func (user *User) HandleJSONMessage(message json.RawMessage) {
-	if !json.Valid(message) {
+func (user *User) HandleJSONMessage(evt whatsapp.RawJSONMessage) {
+	if !json.Valid(evt.RawMessage) {
 		return
 	}
-	user.log.Debugfln("JSON message: %s", message)
+	user.log.Debugfln("JSON message with tag %s: %s", evt.Tag, evt.RawMessage)
 	user.updateLastConnectionIfNecessary()
 }
 
