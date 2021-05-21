@@ -30,6 +30,7 @@ import (
 
 	"github.com/skip2/go-qrcode"
 	log "maunium.net/go/maulogger/v2"
+
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/pushrules"
 
@@ -744,19 +745,26 @@ func (user *User) updateChatTag(intent *appservice.IntentAPI, portal *Portal, ta
 	}
 }
 
+type CustomReadReceipt struct {
+	Timestamp    int64 `json:"ts,omitempty"`
+	DoublePuppet bool  `json:"net.maunium.whatsapp.puppet,omitempty"`
+}
+
 func (user *User) syncChatDoublePuppetDetails(doublePuppet *Puppet, chat Chat, justCreated bool) {
 	if doublePuppet == nil || doublePuppet.CustomIntent() == nil {
 		return
 	}
 	intent := doublePuppet.CustomIntent()
-	if chat.UnreadCount == 0 {
-		lastMessage := user.bridge.DB.Message.GetLastInChat(chat.Portal.Key)
+	if chat.UnreadCount == 0 && (justCreated || !user.bridge.Config.Bridge.MarkReadOnlyOnCreate) {
+		lastMessage := user.bridge.DB.Message.GetLastInChatBefore(chat.Portal.Key, chat.ReceivedAt.Unix())
 		if lastMessage != nil {
-			err := intent.MarkRead(chat.Portal.MXID, lastMessage.MXID)
+			err := intent.MarkReadWithContent(chat.Portal.MXID, lastMessage.MXID, &CustomReadReceipt{DoublePuppet: true})
 			if err != nil {
 				user.log.Warnln("Failed to mark %s in %s as read after backfill: %v", lastMessage.MXID, chat.Portal.MXID, err)
 			}
 		}
+	} else if chat.UnreadCount == -1 {
+		user.log.Debugfln("Invalid unread count (missing field?) in chat info %+v", chat.Source)
 	}
 	if justCreated || !user.bridge.Config.Bridge.TagOnlyOnCreate {
 		user.updateChatMute(intent, chat.Portal, chat.MutedUntil)
@@ -1223,7 +1231,7 @@ func (user *User) HandleMsgInfo(info whatsapp.JSONMsgInfo) {
 				continue
 			}
 
-			err := intent.MarkRead(portal.MXID, msg.MXID)
+			err := intent.MarkReadWithContent(portal.MXID, msg.MXID, &CustomReadReceipt{DoublePuppet: intent.IsCustomPuppet})
 			if err != nil {
 				user.log.Warnln("Failed to mark message %s as read by %s: %v", msg.MXID, info.SenderJID, err)
 			}
@@ -1274,7 +1282,7 @@ func (user *User) markSelfRead(jid, messageID string) {
 		}
 		user.log.Debugfln("User read message %s/%s in %s/%s in WhatsApp mobile", message.JID, message.MXID, portal.Key.JID, portal.MXID)
 	}
-	err := intent.MarkRead(portal.MXID, message.MXID)
+	err := intent.MarkReadWithContent(portal.MXID, message.MXID, &CustomReadReceipt{DoublePuppet: true})
 	if err != nil {
 		user.log.Warnfln("Failed to bridge own read receipt in %s: %v", jid, err)
 	}
