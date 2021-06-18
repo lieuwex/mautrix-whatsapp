@@ -760,7 +760,7 @@ func (user *User) syncChatDoublePuppetDetails(doublePuppet *Puppet, chat Chat, j
 		if lastMessage != nil {
 			err := intent.MarkReadWithContent(chat.Portal.MXID, lastMessage.MXID, &CustomReadReceipt{DoublePuppet: true})
 			if err != nil {
-				user.log.Warnln("Failed to mark %s in %s as read after backfill: %v", lastMessage.MXID, chat.Portal.MXID, err)
+				user.log.Warnfln("Failed to mark %s in %s as read after backfill: %v", lastMessage.MXID, chat.Portal.MXID, err)
 			}
 		}
 	} else if chat.UnreadCount == -1 {
@@ -989,7 +989,7 @@ func (user *User) HandleError(err error) {
 		user.bridge.Metrics.TrackDisconnection(user.MXID)
 		user.ConnectionErrors++
 		go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection failed: %v", failed.Err))
-	} else if err == whatsapp.ErrPingFalse {
+	} else if err == whatsapp.ErrPingFalse || err == whatsapp.ErrWebsocketKeepaliveFailed {
 		disconnectErr := user.Conn.Disconnect()
 		if disconnectErr != nil {
 			user.log.Warnln("Failed to disconnect after failed ping:", disconnectErr)
@@ -1236,7 +1236,7 @@ func (user *User) HandleMsgInfo(info whatsapp.JSONMsgInfo) {
 
 			err := intent.MarkReadWithContent(portal.MXID, msg.MXID, &CustomReadReceipt{DoublePuppet: intent.IsCustomPuppet})
 			if err != nil {
-				user.log.Warnln("Failed to mark message %s as read by %s: %v", msg.MXID, info.SenderJID, err)
+				user.log.Warnfln("Failed to mark message %s as read by %s: %v", msg.MXID, info.SenderJID, err)
 			}
 		}
 	}
@@ -1370,7 +1370,7 @@ func (user *User) HandleChatUpdate(cmd whatsapp.ChatUpdate) {
 	case whatsapp.ChatActionRemove:
 		go portal.HandleWhatsAppKick(nil, cmd.Data.SenderJID, cmd.Data.UserChange.JIDs)
 	case whatsapp.ChatActionAdd:
-		go portal.HandleWhatsAppInvite(cmd.Data.SenderJID, nil, cmd.Data.UserChange.JIDs)
+		go portal.HandleWhatsAppInvite(user, cmd.Data.SenderJID, nil, cmd.Data.UserChange.JIDs)
 	case whatsapp.ChatActionIntroduce:
 		if cmd.Data.SenderJID != "unknown" {
 			go portal.Sync(user, whatsapp.Contact{JID: portal.Key.JID})
