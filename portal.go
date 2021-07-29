@@ -2090,7 +2090,8 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 	}
 	if evt.Type == event.EventSticker {
 		content.MsgType = event.MsgImage
-	} else if content.MsgType == event.MsgImage && content.GetInfo().MimeType == "image/gif" {
+	}
+	if content.MsgType == event.MsgImage && content.GetInfo().MimeType == "image/gif" {
 		content.MsgType = event.MsgVideo
 	}
 
