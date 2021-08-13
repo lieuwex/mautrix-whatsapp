@@ -44,9 +44,9 @@ import (
 var (
 	// These are static
 	Name = "mautrix-whatsapp"
-	URL  = "https://github.com/tulir/mautrix-whatsapp"
+	URL  = "https://github.com/mautrix/whatsapp"
 	// This is changed when making a release
-	Version = "0.1.7"
+	Version = "0.1.8"
 	// This is filled by init()
 	WAVersion = ""
 	VersionString = ""
