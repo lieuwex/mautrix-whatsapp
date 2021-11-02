@@ -17,13 +17,16 @@
 package config
 
 import (
-	"io/ioutil"
+	"fmt"
+	"os"
 
 	"gopkg.in/yaml.v2"
 	"maunium.net/go/mautrix/id"
 
 	"maunium.net/go/mautrix/appservice"
 )
+
+var ExampleConfig string
 
 type Config struct {
 	Homeserver struct {
@@ -45,8 +48,6 @@ type Config struct {
 			MaxOpenConns int `yaml:"max_open_conns"`
 			MaxIdleConns int `yaml:"max_idle_conns"`
 		} `yaml:"database"`
-
-		StateStore string `yaml:"state_store_path,omitempty"`
 
 		Provisioning struct {
 			Prefix       string `yaml:"prefix"`
@@ -90,22 +91,17 @@ func (config *Config) CanDoublePuppet(userID id.UserID) bool {
 	return true
 }
 
-func (config *Config) setDefaults() {
-	config.AppService.Database.MaxOpenConns = 20
-	config.AppService.Database.MaxIdleConns = 2
-	config.WhatsApp.OSName = "Mautrix-WhatsApp bridge"
-	config.WhatsApp.BrowserName = "mx-wa"
-	config.Bridge.setDefaults()
-}
-
 func Load(path string) (*Config, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
 	var config = &Config{}
-	config.setDefaults()
+	err = yaml.UnmarshalStrict([]byte(ExampleConfig), config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal example config: %w", err)
+	}
 	err = yaml.Unmarshal(data, config)
 	return config, err
 }
@@ -115,7 +111,7 @@ func (config *Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(path, data, 0600)
+	return os.WriteFile(path, data, 0600)
 }
 
 func (config *Config) MakeAppService() (*appservice.AppService, error) {
