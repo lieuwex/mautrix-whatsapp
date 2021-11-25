@@ -27,11 +27,10 @@ import (
 
 	"github.com/skip2/go-qrcode"
 
-	"go.mau.fi/whatsmeow/appstate"
-
 	"maunium.net/go/maulogger/v2"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
 
 	"maunium.net/go/mautrix"
@@ -136,7 +135,7 @@ func (handler *CommandHandler) CommandMux(ce *CommandEvent) {
 		handler.CommandLogout(ce)
 	case "toggle":
 		handler.CommandToggle(ce)
-	case "set-relay", "unset-relay", "login-matrix", "sync", "list", "open", "pm", "invite-link", "check-invite", "join", "create", "accept":
+	case "set-relay", "unset-relay", "login-matrix", "sync", "list", "search", "open", "pm", "invite-link", "check-invite", "join", "create", "accept":
 		if !ce.User.HasSession() {
 			ce.Reply("You are not logged in. Use the `login` command to log into WhatsApp.")
 			return
@@ -156,6 +155,8 @@ func (handler *CommandHandler) CommandMux(ce *CommandEvent) {
 			handler.CommandSync(ce)
 		case "list":
 			handler.CommandList(ce)
+		case "search":
+			handler.CommandSearch(ce)
 		case "open":
 			handler.CommandOpen(ce)
 		case "pm":
@@ -709,6 +710,7 @@ func (handler *CommandHandler) CommandHelp(ce *CommandEvent) {
 		cmdPrefix + cmdLogoutMatrixHelp,
 		cmdPrefix + cmdToggleHelp,
 		cmdPrefix + cmdListHelp,
+		cmdPrefix + cmdSearchHelp,
 		cmdPrefix + cmdSyncHelp,
 		cmdPrefix + cmdOpenHelp,
 		cmdPrefix + cmdPMHelp,
@@ -811,7 +813,15 @@ func (handler *CommandHandler) CommandDeleteAllPortals(ce *CommandEvent) {
 
 const cmdListHelp = `list <contacts|groups> [page] [items per page] - Get a list of all contacts and groups.`
 
-func formatContacts(bridge *Bridge, input map[types.JID]types.ContactInfo) (result []string) {
+func matchesQuery(str string, query string) bool {
+	if query == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(str), query)
+}
+
+func formatContacts(bridge *Bridge, input map[types.JID]types.ContactInfo, query string) (result []string) {
+	hasQuery := len(query) > 0
 	for jid, contact := range input {
 		if len(contact.FullName) == 0 {
 			continue
@@ -821,15 +831,21 @@ func formatContacts(bridge *Bridge, input map[types.JID]types.ContactInfo) (resu
 		if len(pushName) == 0 {
 			pushName = contact.FullName
 		}
-		result = append(result, fmt.Sprintf("* %s / [%s](https://matrix.to/#/%s) - `+%s`", contact.FullName, pushName, puppet.MXID, jid.User))
+
+		if !hasQuery || matchesQuery(pushName, query) || matchesQuery(contact.FullName, query) || matchesQuery(jid.User, query) {
+			result = append(result, fmt.Sprintf("* %s / [%s](https://matrix.to/#/%s) - `+%s`", contact.FullName, pushName, puppet.MXID, jid.User))
+		}
 	}
 	sort.Sort(sort.StringSlice(result))
 	return
 }
 
-func formatGroups(input []*types.GroupInfo) (result []string) {
+func formatGroups(input []*types.GroupInfo, query string) (result []string) {
+	hasQuery := len(query) > 0
 	for _, group := range input {
-		result = append(result, fmt.Sprintf("* %s - `%s`", group.GroupName.Name, group.JID.User))
+		if !hasQuery || matchesQuery(group.GroupName.Name, query) || matchesQuery(group.JID.User, query) {
+			result = append(result, fmt.Sprintf("* %s - `%s`", group.GroupName.Name, group.JID.User))
+		}
 	}
 	sort.Sort(sort.StringSlice(result))
 	return
@@ -875,14 +891,14 @@ func (handler *CommandHandler) CommandList(ce *CommandEvent) {
 			ce.Reply("Failed to get contacts: %s", err)
 			return
 		}
-		result = formatContacts(ce.User.bridge, contactList)
+		result = formatContacts(ce.User.bridge, contactList, "")
 	} else {
 		groupList, err := ce.User.Client.GetJoinedGroups()
 		if err != nil {
 			ce.Reply("Failed to get groups: %s", err)
 			return
 		}
-		result = formatGroups(groupList)
+		result = formatGroups(groupList, "")
 	}
 
 	if len(result) == 0 {
@@ -904,6 +920,45 @@ func (handler *CommandHandler) CommandList(ce *CommandEvent) {
 	}
 	result = result[(page-1)*max : lastIndex]
 	ce.Reply("### %s (page %d of %d)\n\n%s", typeName, page, pages, strings.Join(result, "\n"))
+}
+
+const cmdSearchHelp = `search <query> - Search for contacts or groups.`
+
+func (handler *CommandHandler) CommandSearch(ce *CommandEvent) {
+	if len(ce.Args) == 0 {
+		ce.Reply("**Usage:** `search <query>`")
+		return
+	}
+
+	contactList, err := ce.User.Client.Store.Contacts.GetAllContacts()
+	if err != nil {
+		ce.Reply("Failed to get contacts: %s", err)
+		return
+	}
+	groupList, err := ce.User.Client.GetJoinedGroups()
+	if err != nil {
+		ce.Reply("Failed to get groups: %s", err)
+		return
+	}
+
+	query := strings.ToLower(strings.TrimSpace(strings.Join(ce.Args, " ")))
+	formattedContacts := strings.Join(formatContacts(ce.User.bridge, contactList, query), "\n")
+	formattedGroups := strings.Join(formatGroups(groupList, query), "\n")
+
+	result := make([]string, 0, 2)
+	if len(formattedContacts) > 0 {
+		result = append(result, "### Contacts\n\n" + formattedContacts)
+	}
+	if len(formattedGroups) > 0 {
+		result = append(result, "### Groups\n\n" + formattedGroups)
+	}
+
+	if len(result) == 0 {
+		ce.Reply("No contacts or groups found")
+		return
+	}
+
+	ce.Reply(strings.Join(result, "\n\n"))
 }
 
 const cmdOpenHelp = `open <_group JID_> - Open a group chat portal.`
