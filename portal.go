@@ -375,7 +375,7 @@ func (portal *Portal) handleFakeMessage(msg fakeMessage) {
 		Body:    msg.Text,
 	}, nil, msg.Time.UnixMilli())
 	if err != nil {
-		portal.log.Errorln("Failed to send %s to Matrix: %v", msg.ID, err)
+		portal.log.Errorfln("Failed to send %s to Matrix: %v", msg.ID, err)
 	} else {
 		portal.finishHandling(nil, &types.MessageInfo{
 			ID:        msg.ID,
@@ -425,7 +425,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		}
 		resp, err := portal.sendMessage(converted.Intent, converted.Type, converted.Content, converted.Extra, evt.Info.Timestamp.UnixMilli())
 		if err != nil {
-			portal.log.Errorln("Failed to send %s to Matrix: %v", msgID, err)
+			portal.log.Errorfln("Failed to send %s to Matrix: %v", msgID, err)
 		} else {
 			eventID = resp.EventID
 		}
@@ -433,7 +433,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		if converted.Caption != nil && existingMsg == nil {
 			resp, err = portal.sendMessage(converted.Intent, converted.Type, converted.Caption, nil, evt.Info.Timestamp.UnixMilli())
 			if err != nil {
-				portal.log.Errorln("Failed to send caption of %s to Matrix: %v", msgID, err)
+				portal.log.Errorfln("Failed to send caption of %s to Matrix: %v", msgID, err)
 			} else {
 				eventID = resp.EventID
 			}
@@ -2170,12 +2170,15 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	msg := portal.bridge.DB.Message.GetByMXID(evt.Redacts)
 	if msg == nil {
 		portal.log.Debugfln("Ignoring redaction %s of unknown event by %s", msg, senderLogIdentifier)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target not found"), true)
 		return
 	} else if msg.IsFakeJID() {
 		portal.log.Debugfln("Ignoring redaction %s of fake event by %s", msg, senderLogIdentifier)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target is a fake event"), true)
 		return
 	} else if msg.Sender.User != sender.JID.User {
 		portal.log.Debugfln("Ignoring redaction %s of %s/%s by %s: message was sent by someone else (%s, not %s)", evt.ID, msg.MXID, msg.JID, senderLogIdentifier, msg.Sender, sender.JID)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("message was sent by someone else"), true)
 		return
 	}
 
