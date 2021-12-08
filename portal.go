@@ -198,6 +198,9 @@ type Portal struct {
 
 	privateChatBackfillInvitePuppet func()
 
+	currentlyTyping     []id.UserID
+	currentlyTypingLock sync.Mutex
+
 	messages chan PortalMessage
 
 	relayUser *User
@@ -237,7 +240,7 @@ func containsSupportedMessage(waMsg *waProto.Message) bool {
 	return waMsg.Conversation != nil || waMsg.ExtendedTextMessage != nil || waMsg.ImageMessage != nil ||
 		waMsg.StickerMessage != nil || waMsg.AudioMessage != nil || waMsg.VideoMessage != nil ||
 		waMsg.DocumentMessage != nil || waMsg.ContactMessage != nil || waMsg.LocationMessage != nil ||
-		waMsg.GroupInviteMessage != nil
+		waMsg.LiveLocationMessage != nil || waMsg.GroupInviteMessage != nil
 }
 
 func isPotentiallyInteresting(waMsg *waProto.Message) bool {
@@ -276,6 +279,8 @@ func getMessageType(waMsg *waProto.Message) string {
 		return "contact"
 	case waMsg.LocationMessage != nil:
 		return "location"
+	case waMsg.LiveLocationMessage != nil:
+		return "live location start"
 	case waMsg.GroupInviteMessage != nil:
 		return "group invite"
 	case waMsg.ProtocolMessage != nil:
@@ -312,6 +317,8 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 		return portal.convertContactMessage(intent, waMsg.GetContactMessage())
 	case waMsg.LocationMessage != nil:
 		return portal.convertLocationMessage(intent, waMsg.GetLocationMessage())
+	case waMsg.LiveLocationMessage != nil:
+		return portal.convertLiveLocationMessage(intent, waMsg.GetLiveLocationMessage())
 	case waMsg.GroupInviteMessage != nil:
 		return portal.convertGroupInviteMessage(intent, info, waMsg.GetGroupInviteMessage())
 	default:
@@ -1288,6 +1295,22 @@ func (portal *Portal) convertTextMessage(intent *appservice.IntentAPI, msg *waPr
 	return &ConvertedMessage{Intent: intent, Type: event.EventMessage, Content: content, ReplyTo: replyTo}
 }
 
+func (portal *Portal) convertLiveLocationMessage(intent *appservice.IntentAPI, msg *waProto.LiveLocationMessage) *ConvertedMessage {
+	content := &event.MessageEventContent{
+		Body:    "Started sharing live location",
+		MsgType: event.MsgNotice,
+	}
+	if len(msg.GetCaption()) > 0 {
+		content.Body += ": " + msg.GetCaption()
+	}
+	return &ConvertedMessage{
+		Intent:  intent,
+		Type:    event.EventMessage,
+		Content: content,
+		ReplyTo: msg.GetContextInfo().GetStanzaId(),
+	}
+}
+
 func (portal *Portal) convertLocationMessage(intent *appservice.IntentAPI, msg *waProto.LocationMessage) *ConvertedMessage {
 	url := msg.GetUrl()
 	if len(url) == 0 {
@@ -2146,10 +2169,10 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 	if err != nil {
 		portal.log.Errorfln("Error sending message: %v", err)
 		portal.sendErrorMessage(err.Error(), true)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, err, true)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, err, true, 0)
 	} else {
 		portal.log.Debugfln("Handled Matrix event %s", evt.ID)
-		portal.bridge.AS.SendMessageSendCheckpoint(evt, appservice.StepRemote)
+		portal.bridge.AS.SendMessageSendCheckpoint(evt, appservice.StepRemote, 0)
 		portal.sendDeliveryReceipt(evt.ID)
 		dbMsg.MarkSent(ts)
 	}
@@ -2170,15 +2193,15 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	msg := portal.bridge.DB.Message.GetByMXID(evt.Redacts)
 	if msg == nil {
 		portal.log.Debugfln("Ignoring redaction %s of unknown event by %s", msg, senderLogIdentifier)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target not found"), true)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target not found"), true, 0)
 		return
 	} else if msg.IsFakeJID() {
 		portal.log.Debugfln("Ignoring redaction %s of fake event by %s", msg, senderLogIdentifier)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target is a fake event"), true)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target is a fake event"), true, 0)
 		return
 	} else if msg.Sender.User != sender.JID.User {
 		portal.log.Debugfln("Ignoring redaction %s of %s/%s by %s: message was sent by someone else (%s, not %s)", evt.ID, msg.MXID, msg.JID, senderLogIdentifier, msg.Sender, sender.JID)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("message was sent by someone else"), true)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("message was sent by someone else"), true, 0)
 		return
 	}
 
@@ -2186,15 +2209,20 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	_, err := sender.Client.RevokeMessage(portal.Key.JID, msg.JID)
 	if err != nil {
 		portal.log.Errorfln("Error handling Matrix redaction %s: %v", evt.ID, err)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, err, true)
+		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, err, true, 0)
 	} else {
 		portal.log.Debugfln("Handled Matrix redaction %s of %s", evt.ID, evt.Redacts)
-		portal.bridge.AS.SendMessageSendCheckpoint(evt, appservice.StepRemote)
+		portal.bridge.AS.SendMessageSendCheckpoint(evt, appservice.StepRemote, 0)
 		portal.sendDeliveryReceipt(evt.ID)
 	}
 }
 
 func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, receiptTimestamp time.Time) {
+	if !sender.IsLoggedIn() {
+		portal.log.Debugfln("Ignoring read receipt by %s: user is not connected to WhatsApp", sender.JID)
+		return
+	}
+
 	maxTimestamp := receiptTimestamp
 	if message := portal.bridge.DB.Message.GetByMXID(eventID); message != nil {
 		maxTimestamp = message.Timestamp
@@ -2220,6 +2248,51 @@ func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, 
 			portal.log.Warnfln("Failed to mark %v as read by %s: %v", ids, sender.JID, err)
 		}
 	}
+}
+
+func typingDiff(prev, new []id.UserID) (started, stopped []id.UserID) {
+OuterNew:
+	for _, userID := range new {
+		for _, previousUserID := range prev {
+			if userID == previousUserID {
+				continue OuterNew
+			}
+		}
+		started = append(started, userID)
+	}
+OuterPrev:
+	for _, userID := range prev {
+		for _, previousUserID := range new {
+			if userID == previousUserID {
+				continue OuterPrev
+			}
+		}
+		stopped = append(stopped, userID)
+	}
+	return
+}
+
+func (portal *Portal) setTyping(userIDs []id.UserID, state types.ChatPresence) {
+	for _, userID := range userIDs {
+		user := portal.bridge.GetUserByMXIDIfExists(userID)
+		if user == nil || !user.IsLoggedIn() {
+			continue
+		}
+		portal.log.Debugfln("Bridging typing change from %s to chat presence %s", state, user.MXID)
+		err := user.Client.SendChatPresence(state, portal.Key.JID)
+		if err != nil {
+			portal.log.Warnln("Error sending chat presence:", err)
+		}
+	}
+}
+
+func (portal *Portal) HandleMatrixTyping(newTyping []id.UserID) {
+	portal.currentlyTypingLock.Lock()
+	defer portal.currentlyTypingLock.Unlock()
+	startedTyping, stoppedTyping := typingDiff(portal.currentlyTyping, newTyping)
+	portal.currentlyTyping = newTyping
+	portal.setTyping(startedTyping, types.ChatPresenceComposing)
+	portal.setTyping(stoppedTyping, types.ChatPresencePaused)
 }
 
 func (portal *Portal) canBridgeFrom(sender *User, evtType string) bool {

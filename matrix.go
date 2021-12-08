@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2020 Tulir Asokan
+// Copyright (C) 2021 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"go.mau.fi/whatsmeow/types"
 	"maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix"
@@ -57,6 +58,9 @@ func NewMatrixHandler(bridge *Bridge) *MatrixHandler {
 	bridge.EventProcessor.On(event.StateRoomAvatar, handler.HandleRoomMetadata)
 	bridge.EventProcessor.On(event.StateTopic, handler.HandleRoomMetadata)
 	bridge.EventProcessor.On(event.StateEncryption, handler.HandleEncryption)
+	bridge.EventProcessor.On(event.EphemeralEventPresence, handler.HandlePresence)
+	bridge.EventProcessor.On(event.EphemeralEventReceipt, handler.HandleReceipt)
+	bridge.EventProcessor.On(event.EphemeralEventTyping, handler.HandleTyping)
 	return handler
 }
 
@@ -335,27 +339,30 @@ func (mx *MatrixHandler) HandleEncrypted(evt *event.Event) {
 	}
 
 	decrypted, err := mx.bridge.Crypto.Decrypt(evt)
+	decryptionRetryCount := 0
 	if errors.Is(err, NoSessionFound) {
 		content := evt.Content.AsEncrypted()
 		mx.log.Debugfln("Couldn't find session %s trying to decrypt %s, waiting %d seconds...", content.SessionID, evt.ID, int(sessionWaitTimeout.Seconds()))
+		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, false, decryptionRetryCount)
+		decryptionRetryCount++
 		if mx.bridge.Crypto.WaitForSession(evt.RoomID, content.SenderKey, content.SessionID, sessionWaitTimeout) {
 			mx.log.Debugfln("Got session %s after waiting, trying to decrypt %s again", content.SessionID, evt.ID)
 			decrypted, err = mx.bridge.Crypto.Decrypt(evt)
 		} else {
-			mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, fmt.Errorf("didn't receive encryption keys"), false)
+			mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, fmt.Errorf("didn't receive encryption keys"), false, decryptionRetryCount)
 			go mx.waitLongerForSession(evt)
 			return
 		}
 	}
 	if err != nil {
-		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, true)
+		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, true, decryptionRetryCount)
 
 		mx.log.Warnfln("Failed to decrypt %s: %v", evt.ID, err)
 		_, _ = mx.bridge.Bot.SendNotice(evt.RoomID, fmt.Sprintf(
 			"\u26a0 Your message was not bridged: %v", err))
 		return
 	}
-	mx.as.SendMessageSendCheckpoint(decrypted, appservice.StepDecrypted)
+	mx.as.SendMessageSendCheckpoint(decrypted, appservice.StepDecrypted, decryptionRetryCount)
 	mx.bridge.EventProcessor.Dispatch(decrypted)
 }
 
@@ -381,17 +388,17 @@ func (mx *MatrixHandler) waitLongerForSession(evt *event.Event) {
 		mx.log.Debugfln("Got session %s after waiting more, trying to decrypt %s again", content.SessionID, evt.ID)
 		decrypted, err := mx.bridge.Crypto.Decrypt(evt)
 		if err == nil {
-			mx.as.SendMessageSendCheckpoint(decrypted, appservice.StepDecrypted)
+			mx.as.SendMessageSendCheckpoint(decrypted, appservice.StepDecrypted, 2)
 			mx.bridge.EventProcessor.Dispatch(decrypted)
 			_, _ = mx.bridge.Bot.RedactEvent(evt.RoomID, resp.EventID)
 			return
 		}
 		mx.log.Warnfln("Failed to decrypt %s: %v", evt.ID, err)
-		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, true)
+		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, true, 2)
 		update.Body = fmt.Sprintf("\u26a0 Your message was not bridged: %v", err)
 	} else {
 		mx.log.Debugfln("Didn't get %s, giving up on %s", content.SessionID, evt.ID)
-		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, fmt.Errorf("didn't receive encryption keys"), true)
+		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, fmt.Errorf("didn't receive encryption keys"), true, 2)
 		update.Body = "\u26a0 Your message was not bridged: the bridge hasn't received the decryption keys. " +
 			"If this error keeps happening, try restarting your client."
 	}
@@ -473,4 +480,62 @@ func (mx *MatrixHandler) HandleRedaction(evt *event.Event) {
 	if portal != nil && (user.Whitelisted || portal.HasRelaybot()) {
 		portal.HandleMatrixRedaction(user, evt)
 	}
+}
+
+func (mx *MatrixHandler) HandlePresence(evt *event.Event) {
+	user := mx.bridge.GetUserByMXIDIfExists(evt.Sender)
+	if user == nil || !user.IsLoggedIn() {
+		return
+	}
+	customPuppet := mx.bridge.GetPuppetByCustomMXID(user.MXID)
+	// TODO move this flag to the user and/or portal data
+	if customPuppet != nil && !customPuppet.EnablePresence {
+		return
+	}
+
+	presence := types.PresenceAvailable
+	if evt.Content.AsPresence().Presence != event.PresenceOnline {
+		presence = types.PresenceUnavailable
+		user.log.Debugln("Marking offline")
+	} else {
+		user.log.Debugln("Marking online")
+	}
+	user.lastPresence = presence
+	if user.Client.Store.PushName != "" {
+		err := user.Client.SendPresence(presence)
+		if err != nil {
+			user.log.Warnln("Failed to set presence:", err)
+		}
+	}
+}
+
+func (mx *MatrixHandler) HandleReceipt(evt *event.Event) {
+	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
+	if portal == nil {
+		return
+	}
+
+	for eventID, receipts := range *evt.Content.AsReceipt() {
+		for userID, receipt := range receipts.Read {
+			if user := mx.bridge.GetUserByMXIDIfExists(userID); user == nil {
+				// Not a bridge user
+			} else if customPuppet := mx.bridge.GetPuppetByCustomMXID(user.MXID); customPuppet != nil && !customPuppet.EnableReceipts {
+				// TODO move this flag to the user and/or portal data
+				continue
+			} else if isDoublePuppeted, _ := receipt.Extra[doublePuppetField].(bool); isDoublePuppeted {
+				// Ignore double puppeted read receipts.
+				user.log.Debugfln("Ignoring double puppeted read receipt %+v", evt.Content.Raw)
+			} else {
+				portal.HandleMatrixReadReceipt(user, eventID, time.UnixMilli(receipt.Timestamp))
+			}
+		}
+	}
+}
+
+func (mx *MatrixHandler) HandleTyping(evt *event.Event) {
+	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
+	if portal == nil {
+		return
+	}
+	portal.HandleMatrixTyping(evt.Content.AsTyping().UserIDs)
 }
