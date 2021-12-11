@@ -1555,12 +1555,17 @@ type MediaMessage interface {
 type MediaMessageWithThumbnail interface {
 	MediaMessage
 	GetJpegThumbnail() []byte
-	GetCaption() string
 }
 
 type MediaMessageWithCaption interface {
 	MediaMessage
 	GetCaption() string
+}
+
+type MediaMessageWithDimensions interface {
+	MediaMessage
+	GetHeight() uint32
+	GetWidth() uint32
 }
 
 type MediaMessageWithFileName interface {
@@ -1604,7 +1609,12 @@ func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *
 	}
 
 	var width, height int
-	if strings.HasPrefix(msg.GetMimetype(), "image/") {
+	messageWithDimensions, ok := msg.(MediaMessageWithDimensions)
+	if ok {
+		width = int(messageWithDimensions.GetWidth())
+		height = int(messageWithDimensions.GetHeight())
+	}
+	if width == 0 && height == 0 && strings.HasPrefix(msg.GetMimetype(), "image/") {
 		cfg, _, _ := image.DecodeConfig(bytes.NewReader(data))
 		width, height = cfg.Width, cfg.Height
 	}
@@ -1983,7 +1993,7 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 		}
 	}
 	relaybotFormatted := false
-	if !sender.IsLoggedIn() {
+	if !sender.IsLoggedIn() || (portal.IsPrivateChat() && sender.JID.User != portal.Key.Receiver.User) {
 		if !portal.HasRelaybot() {
 			portal.log.Warnln("Ignoring message from", sender.MXID, "in chat with no relaybot (convertMatrixMessage)")
 			return nil, sender
@@ -2192,11 +2202,11 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 
 	msg := portal.bridge.DB.Message.GetByMXID(evt.Redacts)
 	if msg == nil {
-		portal.log.Debugfln("Ignoring redaction %s of unknown event by %s", msg, senderLogIdentifier)
+		portal.log.Debugfln("Ignoring redaction %s of unknown event by %s", evt.ID, senderLogIdentifier)
 		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target not found"), true, 0)
 		return
 	} else if msg.IsFakeJID() {
-		portal.log.Debugfln("Ignoring redaction %s of fake event by %s", msg, senderLogIdentifier)
+		portal.log.Debugfln("Ignoring redaction %s of fake event by %s", evt.ID, senderLogIdentifier)
 		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target is a fake event"), true, 0)
 		return
 	} else if msg.Sender.User != sender.JID.User {
@@ -2311,7 +2321,7 @@ func (portal *Portal) canBridgeFrom(sender *User, evtType string) bool {
 			portal.log.Debugfln("Ignoring %s from non-logged-in user %s in chat with no relay user", evtType, sender.MXID)
 		}
 		return false
-	} else if portal.IsPrivateChat() && sender.JID.User != portal.Key.Receiver.User {
+	} else if portal.IsPrivateChat() && sender.JID.User != portal.Key.Receiver.User && !portal.HasRelaybot() {
 		portal.log.Debugfln("Ignoring %s from different user %s/%s in private chat with no relay user", evtType, sender.MXID, sender.JID)
 		return false
 	}
