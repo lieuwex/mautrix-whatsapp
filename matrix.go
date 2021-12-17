@@ -320,8 +320,7 @@ func (mx *MatrixHandler) shouldIgnoreEvent(evt *event.Event) bool {
 	if _, isPuppet := mx.bridge.ParsePuppetMXID(evt.Sender); evt.Sender == mx.bridge.Bot.UserID || isPuppet {
 		return true
 	}
-	isCustomPuppet, ok := evt.Content.Raw[doublePuppetField].(bool)
-	if ok && isCustomPuppet && mx.bridge.GetPuppetByCustomMXID(evt.Sender) != nil {
+	if val, ok := evt.Content.Raw[doublePuppetKey]; ok && val == doublePuppetValue && mx.bridge.GetPuppetByCustomMXID(evt.Sender) != nil {
 		return true
 	}
 	user := mx.bridge.GetUserByMXID(evt.Sender)
@@ -445,7 +444,7 @@ func (mx *MatrixHandler) HandleMessage(evt *event.Event) {
 
 	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
 	if portal != nil && (user.Whitelisted || portal.HasRelaybot()) {
-		portal.HandleMatrixMessage(user, evt)
+		portal.matrixMessages <- PortalMatrixMessage{user: user, evt: evt}
 	}
 }
 
@@ -479,7 +478,7 @@ func (mx *MatrixHandler) HandleRedaction(evt *event.Event) {
 
 	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
 	if portal != nil && (user.Whitelisted || portal.HasRelaybot()) {
-		portal.HandleMatrixRedaction(user, evt)
+		portal.matrixMessages <- PortalMatrixMessage{user: user, evt: evt}
 	}
 }
 
@@ -523,7 +522,7 @@ func (mx *MatrixHandler) HandleReceipt(evt *event.Event) {
 			} else if customPuppet := mx.bridge.GetPuppetByCustomMXID(user.MXID); customPuppet != nil && !customPuppet.EnableReceipts {
 				// TODO move this flag to the user and/or portal data
 				continue
-			} else if isDoublePuppeted, _ := receipt.Extra[doublePuppetField].(bool); isDoublePuppeted {
+			} else if val, ok := receipt.Extra[doublePuppetKey].(string); ok && customPuppet != nil && val == doublePuppetValue {
 				// Ignore double puppeted read receipts.
 				user.log.Debugfln("Ignoring double puppeted read receipt %+v", evt.Content.Raw)
 			} else {

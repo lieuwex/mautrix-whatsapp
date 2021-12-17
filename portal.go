@@ -141,7 +141,8 @@ func (bridge *Bridge) NewManualPortal(key database.PortalKey) *Portal {
 		bridge: bridge,
 		log:    bridge.Log.Sub(fmt.Sprintf("Portal/%s", key)),
 
-		messages: make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
+		messages:       make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
+		matrixMessages: make(chan PortalMatrixMessage, bridge.Config.Bridge.PortalMessageBuffer),
 	}
 	portal.Key = key
 	go portal.handleMessageLoop()
@@ -154,7 +155,8 @@ func (bridge *Bridge) NewPortal(dbPortal *database.Portal) *Portal {
 		bridge: bridge,
 		log:    bridge.Log.Sub(fmt.Sprintf("Portal/%s", dbPortal.Key)),
 
-		messages: make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
+		messages:       make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
+		matrixMessages: make(chan PortalMatrixMessage, bridge.Config.Bridge.PortalMessageBuffer),
 	}
 	go portal.handleMessageLoop()
 	return portal
@@ -175,6 +177,11 @@ type PortalMessage struct {
 	undecryptable *events.UndecryptableMessage
 	fake          *fakeMessage
 	source        *User
+}
+
+type PortalMatrixMessage struct {
+	evt  *event.Event
+	user *User
 }
 
 type recentlyHandledWrapper struct {
@@ -201,34 +208,55 @@ type Portal struct {
 	currentlyTyping     []id.UserID
 	currentlyTypingLock sync.Mutex
 
-	messages chan PortalMessage
+	messages       chan PortalMessage
+	matrixMessages chan PortalMatrixMessage
 
 	relayUser *User
 }
 
-func (portal *Portal) handleMessageLoop() {
-	for msg := range portal.messages {
-		if len(portal.MXID) == 0 {
-			if msg.fake == nil && (msg.evt == nil || !containsSupportedMessage(msg.evt.Message)) {
-				portal.log.Debugln("Not creating portal room for incoming message: message is not a chat message")
-				continue
-			}
-			portal.log.Debugln("Creating Matrix room from incoming message")
-			err := portal.CreateMatrixRoom(msg.source, nil, false)
-			if err != nil {
-				portal.log.Errorln("Failed to create portal room:", err)
-				continue
-			}
+func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
+	if len(portal.MXID) == 0 {
+		if msg.fake == nil && msg.undecryptable == nil && (msg.evt == nil || !containsSupportedMessage(msg.evt.Message)) {
+			portal.log.Debugln("Not creating portal room for incoming message: message is not a chat message")
+			return
 		}
-		if msg.evt != nil {
-			portal.handleMessage(msg.source, msg.evt)
-		} else if msg.undecryptable != nil {
-			portal.handleUndecryptableMessage(msg.source, msg.undecryptable)
-		} else if msg.fake != nil {
-			msg.fake.ID = "FAKE::" + msg.fake.ID
-			portal.handleFakeMessage(*msg.fake)
-		} else {
-			portal.log.Warnln("Unexpected PortalMessage with no message: %+v", msg)
+		portal.log.Debugln("Creating Matrix room from incoming message")
+		err := portal.CreateMatrixRoom(msg.source, nil, false)
+		if err != nil {
+			portal.log.Errorln("Failed to create portal room:", err)
+			return
+		}
+	}
+	if msg.evt != nil {
+		portal.handleMessage(msg.source, msg.evt)
+	} else if msg.undecryptable != nil {
+		portal.handleUndecryptableMessage(msg.source, msg.undecryptable)
+	} else if msg.fake != nil {
+		msg.fake.ID = "FAKE::" + msg.fake.ID
+		portal.handleFakeMessage(*msg.fake)
+	} else {
+		portal.log.Warnln("Unexpected PortalMessage with no message: %+v", msg)
+	}
+}
+
+func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
+	switch msg.evt.Type {
+	case event.EventMessage, event.EventSticker:
+		portal.HandleMatrixMessage(msg.user, msg.evt)
+	case event.EventRedaction:
+		portal.HandleMatrixRedaction(msg.user, msg.evt)
+	default:
+		portal.log.Warnln("Unsupported event type %+v in portal message channel", msg.evt.Type)
+	}
+}
+
+func (portal *Portal) handleMessageLoop() {
+	for {
+		select {
+		case msg := <-portal.messages:
+			portal.handleMessageLoopItem(msg)
+		case msg := <-portal.matrixMessages:
+			portal.handleMatrixMessageLoopItem(msg)
 		}
 	}
 }
@@ -1210,10 +1238,14 @@ func (portal *Portal) HandleMessageRevoke(user *User, info *types.MessageInfo, k
 		return false
 	}
 	intent := portal.bridge.GetPuppetByJID(info.Sender).IntentFor(portal)
-	_, err := intent.RedactEvent(portal.MXID, msg.MXID)
+	redactionReq := mautrix.ReqRedact{Extra: map[string]interface{}{}}
+	if intent.IsCustomPuppet {
+		redactionReq.Extra[doublePuppetKey] = doublePuppetValue
+	}
+	_, err := intent.RedactEvent(portal.MXID, msg.MXID, redactionReq)
 	if err != nil {
 		if errors.Is(err, mautrix.MForbidden) {
-			_, err = portal.MainIntent().RedactEvent(portal.MXID, msg.MXID)
+			_, err = portal.MainIntent().RedactEvent(portal.MXID, msg.MXID, redactionReq)
 			if err != nil {
 				portal.log.Errorln("Failed to redact %s: %v", msg.JID, err)
 			}
@@ -1243,7 +1275,8 @@ func (portal *Portal) encrypt(content *event.Content, eventType event.Type) (eve
 	return eventType, nil
 }
 
-const doublePuppetField = "net.maunium.whatsapp.puppet"
+const doublePuppetKey = "fi.mau.double_puppet_source"
+const doublePuppetValue = "mautrix-whatsapp"
 
 func (portal *Portal) sendMessage(intent *appservice.IntentAPI, eventType event.Type, content *event.MessageEventContent, extraContent map[string]interface{}, timestamp int64) (*mautrix.RespSendEvent, error) {
 	wrappedContent := event.Content{Parsed: content, Raw: extraContent}
@@ -1251,7 +1284,9 @@ func (portal *Portal) sendMessage(intent *appservice.IntentAPI, eventType event.
 		if wrappedContent.Raw == nil {
 			wrappedContent.Raw = map[string]interface{}{}
 		}
-		wrappedContent.Raw[doublePuppetField] = intent.IsCustomPuppet
+		if intent.IsCustomPuppet {
+			wrappedContent.Raw[doublePuppetKey] = doublePuppetValue
+		}
 	}
 	var err error
 	eventType, err = portal.encrypt(&wrappedContent, eventType)
@@ -1485,7 +1520,7 @@ func (portal *Portal) leaveWithPuppetMeta(intent *appservice.IntentAPI) (*mautri
 			Membership: event.MembershipLeave,
 		},
 		Raw: map[string]interface{}{
-			doublePuppetField: true,
+			doublePuppetKey: doublePuppetValue,
 		},
 	}
 	// Bypass IntentAPI, we don't want to EnsureJoined here
@@ -1508,7 +1543,7 @@ func (portal *Portal) HandleWhatsAppInvite(source *User, senderJID *types.JID, j
 				AvatarURL:   puppet.AvatarURL.CUString(),
 			},
 			Raw: map[string]interface{}{
-				doublePuppetField: true,
+				doublePuppetKey: doublePuppetValue,
 			},
 		}
 		resp, err := intent.SendStateEvent(portal.MXID, event.StateMember, puppet.MXID.String(), &content)
@@ -2249,7 +2284,9 @@ func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, 
 	}
 	groupedMessages := make(map[types.JID][]types.MessageID)
 	for _, msg := range messages {
-		groupedMessages[msg.Sender] = append(groupedMessages[msg.Sender], msg.JID)
+		if !msg.IsFakeJID() {
+			groupedMessages[msg.Sender] = append(groupedMessages[msg.Sender], msg.JID)
+		}
 	}
 	portal.log.Debugfln("Sending read receipts by %s: %v", sender.JID, groupedMessages)
 	for messageSender, ids := range groupedMessages {
