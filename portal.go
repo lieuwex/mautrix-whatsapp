@@ -43,20 +43,19 @@ import (
 	"golang.org/x/image/webp"
 	"google.golang.org/protobuf/proto"
 
-	"maunium.net/go/mautrix/format"
-
-	"go.mau.fi/whatsmeow"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
-
 	log "maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
+
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"maunium.net/go/mautrix-whatsapp/database"
 )
@@ -268,7 +267,7 @@ func containsSupportedMessage(waMsg *waProto.Message) bool {
 	return waMsg.Conversation != nil || waMsg.ExtendedTextMessage != nil || waMsg.ImageMessage != nil ||
 		waMsg.StickerMessage != nil || waMsg.AudioMessage != nil || waMsg.VideoMessage != nil ||
 		waMsg.DocumentMessage != nil || waMsg.ContactMessage != nil || waMsg.LocationMessage != nil ||
-		waMsg.LiveLocationMessage != nil || waMsg.GroupInviteMessage != nil
+		waMsg.LiveLocationMessage != nil || waMsg.GroupInviteMessage != nil || waMsg.ContactsArrayMessage != nil
 }
 
 func isPotentiallyInteresting(waMsg *waProto.Message) bool {
@@ -277,7 +276,7 @@ func isPotentiallyInteresting(waMsg *waProto.Message) bool {
 	}
 	// List of message types that aren't supported, but might potentially be interesting
 	// (so a warning should be logged if they are encountered).
-	return waMsg.Call != nil || waMsg.Chat != nil || waMsg.ContactsArrayMessage != nil ||
+	return waMsg.Call != nil || waMsg.Chat != nil ||
 		waMsg.HighlyStructuredMessage != nil || waMsg.SendPaymentMessage != nil || waMsg.LiveLocationMessage != nil ||
 		waMsg.RequestPaymentMessage != nil || waMsg.DeclinePaymentRequestMessage != nil ||
 		waMsg.CancelPaymentRequestMessage != nil || waMsg.TemplateMessage != nil ||
@@ -305,6 +304,8 @@ func getMessageType(waMsg *waProto.Message) string {
 		return fmt.Sprintf("document %s", waMsg.GetDocumentMessage().GetMimetype())
 	case waMsg.ContactMessage != nil:
 		return "contact"
+	case waMsg.ContactsArrayMessage != nil:
+		return "contact array"
 	case waMsg.LocationMessage != nil:
 		return "location"
 	case waMsg.LiveLocationMessage != nil:
@@ -343,6 +344,8 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 		return portal.convertMediaMessage(intent, source, info, waMsg.GetDocumentMessage())
 	case waMsg.ContactMessage != nil:
 		return portal.convertContactMessage(intent, waMsg.GetContactMessage())
+	case waMsg.ContactsArrayMessage != nil:
+		return portal.convertContactsArrayMessage(intent, waMsg.GetContactsArrayMessage())
 	case waMsg.LocationMessage != nil:
 		return portal.convertLocationMessage(intent, waMsg.GetLocationMessage())
 	case waMsg.LiveLocationMessage != nil:
@@ -452,6 +455,12 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 	}
 	converted := portal.convertMessage(intent, source, &evt.Info, evt.Message)
 	if converted != nil {
+		if evt.Info.IsIncomingBroadcast() {
+			if converted.Extra == nil {
+				converted.Extra = map[string]interface{}{}
+			}
+			converted.Extra["fi.mau.whatsapp.source_broadcast_list"] = evt.Info.Chat.String()
+		}
 		var eventID id.EventID
 		if existingMsg != nil {
 			converted.Content.SetEdit(existingMsg.MXID)
@@ -471,6 +480,14 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 				portal.log.Errorfln("Failed to send caption of %s to Matrix: %v", msgID, err)
 			} else {
 				eventID = resp.EventID
+			}
+		}
+		if converted.MultiEvent != nil && existingMsg == nil {
+			for index, subEvt := range converted.MultiEvent {
+				resp, err = portal.sendMessage(converted.Intent, converted.Type, subEvt, nil, evt.Info.Timestamp.UnixMilli())
+				if err != nil {
+					portal.log.Errorfln("Failed to send sub-event %d of %s to Matrix: %v", index+1, msgID, err)
+				}
 			}
 		}
 		if len(eventID) != 0 {
@@ -522,6 +539,9 @@ func (portal *Portal) markHandled(msg *database.Message, info *types.MessageInfo
 		msg.Sender = info.Sender
 		msg.Sent = isSent
 		msg.DecryptionError = decryptionError
+		if info.IsIncomingBroadcast() {
+			msg.BroadcastListJID = info.Chat
+		}
 		msg.Insert()
 	} else {
 		msg.UpdateMXID(mxid, decryptionError)
@@ -797,39 +817,8 @@ func (portal *Portal) ensureMXIDInvited(mxid id.UserID) {
 	}
 }
 
-func (portal *Portal) ensureUserInvited(user *User) (ok bool) {
-	inviteContent := event.Content{
-		Parsed: &event.MemberEventContent{
-			Membership: event.MembershipInvite,
-			IsDirect:   portal.IsPrivateChat(),
-		},
-		Raw: map[string]interface{}{},
-	}
-	customPuppet := portal.bridge.GetPuppetByCustomMXID(user.MXID)
-	if customPuppet != nil && customPuppet.CustomIntent() != nil {
-		inviteContent.Raw["fi.mau.will_auto_accept"] = true
-	}
-	_, err := portal.MainIntent().SendStateEvent(portal.MXID, event.StateMember, user.MXID.String(), &inviteContent)
-	var httpErr mautrix.HTTPError
-	if err != nil && errors.As(err, &httpErr) && httpErr.RespError != nil && strings.Contains(httpErr.RespError.Err, "is already in the room") {
-		portal.bridge.StateStore.SetMembership(portal.MXID, user.MXID, event.MembershipJoin)
-		ok = true
-	} else if err != nil {
-		portal.log.Warnfln("Failed to invite %s: %v", user.MXID, err)
-	} else {
-		ok = true
-	}
-
-	if customPuppet != nil && customPuppet.CustomIntent() != nil {
-		err = customPuppet.CustomIntent().EnsureJoined(portal.MXID)
-		if err != nil {
-			portal.log.Warnfln("Failed to auto-join portal as %s: %v", user.MXID, err)
-			ok = false
-		} else {
-			ok = true
-		}
-	}
-	return
+func (portal *Portal) ensureUserInvited(user *User) bool {
+	return user.ensureInvited(portal.MainIntent(), portal.MXID, portal.IsPrivateChat())
 }
 
 func (portal *Portal) UpdateMatrixRoom(user *User, groupInfo *types.GroupInfo) bool {
@@ -839,6 +828,7 @@ func (portal *Portal) UpdateMatrixRoom(user *User, groupInfo *types.GroupInfo) b
 	portal.log.Infoln("Syncing portal for", user.MXID)
 
 	portal.ensureUserInvited(user)
+	go portal.addToSpace(user)
 
 	update := false
 	update = portal.UpdateMetadata(user, groupInfo) || update
@@ -963,7 +953,7 @@ func (portal *Portal) getBridgeInfo() (string, event.BridgeEventContent) {
 		Protocol: event.BridgeInfoSection{
 			ID:          "whatsapp",
 			DisplayName: "WhatsApp",
-			AvatarURL:   id.ContentURIString(portal.bridge.Config.AppService.Bot.Avatar),
+			AvatarURL:   portal.bridge.Config.AppService.Bot.ParsedAvatar.CUString(),
 			ExternalURL: "https://www.whatsapp.com/",
 		},
 		Channel: event.BridgeInfoSection{
@@ -1133,6 +1123,8 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	portal.ensureUserInvited(user)
 	user.syncChatDoublePuppetDetails(portal, true)
 
+	go portal.addToSpace(user)
+
 	if groupInfo != nil {
 		portal.SyncParticipants(user, groupInfo)
 		if groupInfo.IsAnnounce {
@@ -1166,6 +1158,22 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 		portal.Update()
 	}
 	return nil
+}
+
+func (portal *Portal) addToSpace(user *User) {
+	spaceID := user.GetSpaceRoom()
+	if len(spaceID) == 0 || user.IsInSpace(portal.Key) {
+		return
+	}
+	_, err := portal.bridge.Bot.SendStateEvent(spaceID, event.StateSpaceChild, portal.MXID.String(), &event.SpaceChildEventContent{
+		Via: []string{portal.bridge.Config.Homeserver.Domain},
+	})
+	if err != nil {
+		portal.log.Errorfln("Failed to add room to %s's personal filtering space (%s): %v", user.MXID, spaceID, err)
+	} else {
+		portal.log.Debugfln("Added room to %s's personal filtering space (%s)", user.MXID, spaceID)
+		user.MarkInSpace(portal.Key)
+	}
 }
 
 func (portal *Portal) IsPrivateChat() bool {
@@ -1307,6 +1315,8 @@ type ConvertedMessage struct {
 	Content *event.MessageEventContent
 	Extra   map[string]interface{}
 	Caption *event.MessageEventContent
+
+	MultiEvent []*event.MessageEventContent
 
 	ReplyTo types.MessageID
 }
@@ -1458,6 +1468,30 @@ func (portal *Portal) convertContactMessage(intent *appservice.IntentAPI, msg *w
 		Type:    event.EventMessage,
 		Content: content,
 		ReplyTo: msg.GetContextInfo().GetStanzaId(),
+	}
+}
+
+func (portal *Portal) convertContactsArrayMessage(intent *appservice.IntentAPI, msg *waProto.ContactsArrayMessage) *ConvertedMessage {
+	name := msg.GetDisplayName()
+	if len(name) == 0 {
+		name = fmt.Sprintf("%d contacts", len(msg.GetContacts()))
+	}
+	contacts := make([]*event.MessageEventContent, 0, len(msg.GetContacts()))
+	for _, contact := range msg.GetContacts() {
+		converted := portal.convertContactMessage(intent, contact)
+		if converted != nil {
+			contacts = append(contacts, converted.Content)
+		}
+	}
+	return &ConvertedMessage{
+		Intent: intent,
+		Type:   event.EventMessage,
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgNotice,
+			Body:    fmt.Sprintf("Sent %s", name),
+		},
+		ReplyTo:    msg.GetContextInfo().GetStanzaId(),
+		MultiEvent: contacts,
 	}
 }
 
@@ -1613,6 +1647,32 @@ type MediaMessageWithDuration interface {
 	GetSeconds() uint32
 }
 
+// MimeExtensionSanityOverrides includes extensions for various common mimetypes.
+//
+// This is necessary because sometimes the OS mimetype database and Go interact in weird ways,
+// which causes very obscure extensions to be first in the array for common mimetypes
+// (e.g. image/jpeg -> .jpe, text/plain -> ,v).
+var MimeExtensionSanityOverrides = map[string]string{
+	"image/png":  ".png",
+	"image/webp": ".webp",
+	"image/jpeg": ".jpg",
+	"image/tiff": ".tiff",
+	"image/heif": ".heic",
+	"image/heic": ".heic",
+
+	"audio/mpeg": ".mp3",
+	"audio/ogg":  ".ogg",
+	"audio/webm": ".webm",
+	"video/mp4":  ".mp4",
+	"video/mpeg": ".mpeg",
+	"video/webm": ".webm",
+
+	"text/plain": ".txt",
+	"text/html":  ".html",
+
+	"application/xml": ".xml",
+}
+
 func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, msg MediaMessage) *ConvertedMessage {
 	messageWithCaption, ok := msg.(MediaMessageWithCaption)
 	var captionContent *event.MessageEventContent
@@ -1689,10 +1749,14 @@ func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *
 			content.Body = mimeClass
 		}
 
-		exts, _ := mime.ExtensionsByType(msg.GetMimetype())
-		if exts != nil && len(exts) > 0 {
-			content.Body += exts[0]
+		ext, ok := MimeExtensionSanityOverrides[strings.Split(msg.GetMimetype(), ";")[0]]
+		if !ok {
+			exts, _ := mime.ExtensionsByType(msg.GetMimetype())
+			if len(exts) > 0 {
+				ext = exts[0]
+			}
 		}
+		content.Body += ext
 	}
 
 	msgWithDuration, ok := msg.(MediaMessageWithDuration)
@@ -2290,13 +2354,25 @@ func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, 
 	}
 	groupedMessages := make(map[types.JID][]types.MessageID)
 	for _, msg := range messages {
-		if !msg.IsFakeJID() {
-			groupedMessages[msg.Sender] = append(groupedMessages[msg.Sender], msg.JID)
-		}
+		var key types.JID
+		if msg.IsFakeJID() || msg.Sender.User == sender.JID.User {
+			// Don't send read receipts for own messages or fake messages
+			continue
+		} else if !portal.IsPrivateChat() {
+			key = msg.Sender
+		} else if !msg.BroadcastListJID.IsEmpty() {
+			key = msg.BroadcastListJID
+		} // else: blank key (participant field isn't needed in direct chat read receipts)
+		groupedMessages[key] = append(groupedMessages[key], msg.JID)
 	}
 	portal.log.Debugfln("Sending read receipts by %s: %v", sender.JID, groupedMessages)
 	for messageSender, ids := range groupedMessages {
-		err := sender.Client.MarkRead(ids, receiptTimestamp, portal.Key.JID, messageSender)
+		chatJID := portal.Key.JID
+		if messageSender.Server == types.BroadcastServer {
+			chatJID = messageSender
+			messageSender = portal.Key.JID
+		}
+		err := sender.Client.MarkRead(ids, receiptTimestamp, chatJID, messageSender)
 		if err != nil {
 			portal.log.Warnfln("Failed to mark %v as read by %s: %v", ids, sender.JID, err)
 		}

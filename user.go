@@ -23,25 +23,25 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	log "maunium.net/go/maulogger/v2"
 
-	"go.mau.fi/whatsmeow/appstate"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
+	"maunium.net/go/mautrix/id"
 	"maunium.net/go/mautrix/pushrules"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
-
-	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/format"
-	"maunium.net/go/mautrix/id"
 
 	"maunium.net/go/mautrix-whatsapp/database"
 )
@@ -58,12 +58,15 @@ type User struct {
 	Whitelisted      bool
 	RelayWhitelisted bool
 
-	mgmtCreateLock sync.Mutex
-	connLock       sync.Mutex
+	mgmtCreateLock  sync.Mutex
+	spaceCreateLock sync.Mutex
+	connLock        sync.Mutex
 
 	historySyncs     chan *events.HistorySync
 	prevBridgeStatus *BridgeState
 	lastPresence     types.Presence
+
+	spaceMembershipChecked bool
 }
 
 func (bridge *Bridge) getUserByMXID(userID id.UserID, onlyIfExists bool) *User {
@@ -178,6 +181,91 @@ func (bridge *Bridge) NewUser(dbUser *database.User) *User {
 	user.Admin = user.bridge.Config.Bridge.Permissions.IsAdmin(user.MXID)
 	go user.handleHistorySyncsLoop()
 	return user
+}
+
+func (user *User) ensureInvited(intent *appservice.IntentAPI, roomID id.RoomID, isDirect bool) (ok bool) {
+	inviteContent := event.Content{
+		Parsed: &event.MemberEventContent{
+			Membership: event.MembershipInvite,
+			IsDirect:   isDirect,
+		},
+		Raw: map[string]interface{}{},
+	}
+	customPuppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
+	if customPuppet != nil && customPuppet.CustomIntent() != nil {
+		inviteContent.Raw["fi.mau.will_auto_accept"] = true
+	}
+	_, err := intent.SendStateEvent(roomID, event.StateMember, user.MXID.String(), &inviteContent)
+	var httpErr mautrix.HTTPError
+	if err != nil && errors.As(err, &httpErr) && httpErr.RespError != nil && strings.Contains(httpErr.RespError.Err, "is already in the room") {
+		user.bridge.StateStore.SetMembership(roomID, user.MXID, event.MembershipJoin)
+		ok = true
+	} else if err != nil {
+		user.log.Warnfln("Failed to invite user to %s: %v", roomID, err)
+	} else {
+		ok = true
+	}
+
+	if customPuppet != nil && customPuppet.CustomIntent() != nil {
+		err = customPuppet.CustomIntent().EnsureJoined(roomID)
+		if err != nil {
+			user.log.Warnfln("Failed to auto-join %s: %v", roomID, err)
+			ok = false
+		} else {
+			ok = true
+		}
+	}
+	return
+}
+
+func (user *User) GetSpaceRoom() id.RoomID {
+	if !user.bridge.Config.Bridge.PersonalFilteringSpaces {
+		return ""
+	}
+
+	if len(user.SpaceRoom) == 0 {
+		user.spaceCreateLock.Lock()
+		defer user.spaceCreateLock.Unlock()
+		if len(user.SpaceRoom) > 0 {
+			return user.SpaceRoom
+		}
+
+		resp, err := user.bridge.Bot.CreateRoom(&mautrix.ReqCreateRoom{
+			Visibility: "private",
+			Name:       "WhatsApp",
+			Topic:      "Your WhatsApp bridged chats",
+			InitialState: []*event.Event{{
+				Type: event.StateRoomAvatar,
+				Content: event.Content{
+					Parsed: &event.RoomAvatarEventContent{
+						URL: user.bridge.Config.AppService.Bot.ParsedAvatar,
+					},
+				},
+			}},
+			CreationContent: map[string]interface{}{
+				"type": event.RoomTypeSpace,
+			},
+			PowerLevelOverride: &event.PowerLevelsEventContent{
+				Users: map[id.UserID]int{
+					user.bridge.Bot.UserID: 9001,
+					user.MXID:              50,
+				},
+			},
+		})
+
+		if err != nil {
+			user.log.Errorln("Failed to auto-create space room:", err)
+		} else {
+			user.SpaceRoom = resp.RoomID
+			user.Update()
+			user.ensureInvited(user.bridge.Bot, user.SpaceRoom, false)
+		}
+	} else if !user.spaceMembershipChecked && !user.bridge.StateStore.IsInRoom(user.SpaceRoom, user.MXID) {
+		user.ensureInvited(user.bridge.Bot, user.SpaceRoom, false)
+	}
+	user.spaceMembershipChecked = true
+
+	return user.SpaceRoom
 }
 
 func (user *User) GetManagementRoom() id.RoomID {
@@ -442,7 +530,7 @@ func (user *User) HandleEvent(event interface{}) {
 	case *events.ChatPresence:
 		go user.handleChatPresence(v)
 	case *events.Message:
-		portal := user.GetPortalByJID(v.Info.Chat)
+		portal := user.GetPortalByMessageSource(v.Info.MessageSource)
 		portal.messages <- PortalMessage{evt: v, source: user}
 	case *events.CallOffer:
 		user.handleCallStart(v.CallCreator, v.CallID, "", v.Timestamp)
@@ -470,7 +558,7 @@ func (user *User) HandleEvent(event interface{}) {
 	case *events.CallTerminate, *events.CallRelayLatency, *events.CallAccept, *events.UnknownCallEvent:
 		// ignore
 	case *events.UndecryptableMessage:
-		portal := user.GetPortalByJID(v.Info.Chat)
+		portal := user.GetPortalByMessageSource(v.Info.MessageSource)
 		portal.messages <- PortalMessage{undecryptable: v, source: user}
 	case *events.HistorySync:
 		user.historySyncs <- v
@@ -667,6 +755,21 @@ func (user *User) handleLoggedOut(onConnect bool) {
 	user.sendBridgeState(BridgeState{StateEvent: StateBadCredentials, Error: WANotLoggedIn})
 }
 
+func (user *User) GetPortalByMessageSource(ms types.MessageSource) *Portal {
+	jid := ms.Chat
+	if ms.IsIncomingBroadcast() {
+		if ms.IsFromMe {
+			jid = ms.BroadcastListOwner.ToNonAD()
+		} else {
+			jid = ms.Sender.ToNonAD()
+		}
+		if jid.IsEmpty() {
+			return nil
+		}
+	}
+	return user.bridge.GetPortalByJID(database.NewPortalKey(jid, user.JID))
+}
+
 func (user *User) GetPortalByJID(jid types.JID) *Portal {
 	return user.bridge.GetPortalByJID(database.NewPortalKey(jid, user.JID))
 }
@@ -737,7 +840,7 @@ func (user *User) handleReceipt(receipt *events.Receipt) {
 	if receipt.Type != events.ReceiptTypeRead && receipt.Type != events.ReceiptTypeReadSelf {
 		return
 	}
-	portal := user.GetPortalByJID(receipt.Chat)
+	portal := user.GetPortalByMessageSource(receipt.MessageSource)
 	if portal == nil || len(portal.MXID) == 0 {
 		return
 	}

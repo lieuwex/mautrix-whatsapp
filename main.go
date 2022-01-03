@@ -179,6 +179,8 @@ type Bridge struct {
 	usersByMXID         map[id.UserID]*User
 	usersByUsername     map[string]*User
 	usersLock           sync.Mutex
+	spaceRooms          map[id.RoomID]*User
+	spaceRoomsLock      sync.Mutex
 	managementRooms     map[id.RoomID]*User
 	managementRoomsLock sync.Mutex
 	portalsByMXID       map[id.RoomID]*Portal
@@ -354,7 +356,7 @@ func (bridge *Bridge) ResendBridgeInfo() {
 
 func (bridge *Bridge) UpdateBotProfile() {
 	bridge.Log.Debugln("Updating bot profile")
-	botConfig := bridge.Config.AppService.Bot
+	botConfig := &bridge.Config.AppService.Bot
 
 	var err error
 	var mxc id.ContentURI
@@ -365,6 +367,7 @@ func (bridge *Bridge) UpdateBotProfile() {
 		if err == nil {
 			err = bridge.Bot.SetAvatarURL(mxc)
 		}
+		botConfig.ParsedAvatar = mxc
 	}
 	if err != nil {
 		bridge.Log.Warnln("Failed to update bot avatar:", err)
@@ -372,7 +375,7 @@ func (bridge *Bridge) UpdateBotProfile() {
 
 	if botConfig.Displayname == "remove" {
 		err = bridge.Bot.SetDisplayName("")
-	} else if len(botConfig.Avatar) > 0 {
+	} else if len(botConfig.Displayname) > 0 {
 		err = bridge.Bot.SetDisplayName(botConfig.Displayname)
 	}
 	if err != nil {
@@ -479,6 +482,7 @@ func main() {
 	(&Bridge{
 		usersByMXID:         make(map[id.UserID]*User),
 		usersByUsername:     make(map[string]*User),
+		spaceRooms:          make(map[id.RoomID]*User),
 		managementRooms:     make(map[id.RoomID]*User),
 		portalsByMXID:       make(map[id.RoomID]*Portal),
 		portalsByJID:        make(map[database.PortalKey]*Portal),

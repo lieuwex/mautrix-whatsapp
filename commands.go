@@ -1068,17 +1068,18 @@ func (handler *CommandHandler) CommandPM(ce *CommandEvent) {
 	ce.Reply("Created portal room with +%s and invited you to it.", puppet.JID.User)
 }
 
-const cmdSyncHelp = `sync <appstate/contacts/groups> [--create-portals] - Synchronize data from WhatsApp.`
+const cmdSyncHelp = `sync <appstate/contacts/groups/space> [--create-portals] - Synchronize data from WhatsApp.`
 
 func (handler *CommandHandler) CommandSync(ce *CommandEvent) {
 	if len(ce.Args) == 0 {
-		ce.Reply("**Usage:** `sync <appstate/contacts/groups> [--create-portals]`")
+		ce.Reply("**Usage:** `sync <appstate/contacts/groups/space> [--create-portals]`")
 		return
 	}
 	args := strings.ToLower(strings.Join(ce.Args, " "))
 	contacts := strings.Contains(args, "contacts")
 	appState := strings.Contains(args, "appstate")
-	groups := strings.Contains(args, "groups")
+	space := strings.Contains(args, "space")
+	groups := strings.Contains(args, "groups") || space
 	createPortals := strings.Contains(args, "--create-portals")
 
 	if appState {
@@ -1099,6 +1100,24 @@ func (handler *CommandHandler) CommandSync(ce *CommandEvent) {
 		} else {
 			ce.Reply("Resynced contacts")
 		}
+	}
+	if space {
+		if !ce.Bridge.Config.Bridge.PersonalFilteringSpaces {
+			ce.Reply("Personal filtering spaces are not enabled on this instance of the bridge")
+			return
+		}
+		keys := ce.Bridge.DB.Portal.FindPrivateChatsNotInSpace(ce.User.JID)
+		count := 0
+		for _, key := range keys {
+			portal := ce.Bridge.GetPortalByJID(key)
+			portal.addToSpace(ce.User)
+			count++
+		}
+		plural := "s"
+		if count == 1 {
+			plural = ""
+		}
+		ce.Reply("Added %d DM room%s to space", count, plural)
 	}
 	if groups {
 		err := ce.User.ResyncGroups(createPortals)
