@@ -437,7 +437,7 @@ func (mx *MatrixHandler) HandleMessage(evt *event.Event) {
 			content.Body = strings.TrimLeft(content.Body[len(commandPrefix):], " ")
 		}
 		if hasCommandPrefix || evt.RoomID == user.ManagementRoom {
-			mx.cmd.Handle(evt.RoomID, user, content.Body, content.GetReplyTo())
+			mx.cmd.Handle(evt.RoomID, evt.ID, user, content.Body, content.GetReplyTo())
 			return
 		}
 	}
@@ -525,6 +525,8 @@ func (mx *MatrixHandler) HandleReceipt(evt *event.Event) {
 			} else if val, ok := receipt.Extra[doublePuppetKey].(string); ok && customPuppet != nil && val == doublePuppetValue {
 				// Ignore double puppeted read receipts.
 				user.log.Debugfln("Ignoring double puppeted read receipt %+v", evt.Content.Raw)
+				// But do start disappearing messages, because the user read the chat
+				portal.ScheduleDisappearing()
 			} else {
 				portal.HandleMatrixReadReceipt(user, eventID, time.UnixMilli(receipt.Timestamp))
 			}

@@ -27,13 +27,9 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	"image/png"
-	"io"
 	"math"
 	"mime"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +47,8 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/util"
+	"maunium.net/go/mautrix/util/ffmpeg"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -270,27 +268,11 @@ func containsSupportedMessage(waMsg *waProto.Message) bool {
 		waMsg.LiveLocationMessage != nil || waMsg.GroupInviteMessage != nil || waMsg.ContactsArrayMessage != nil
 }
 
-func isPotentiallyInteresting(waMsg *waProto.Message) bool {
-	if waMsg == nil {
-		return false
-	}
-	// List of message types that aren't supported, but might potentially be interesting
-	// (so a warning should be logged if they are encountered).
-	return waMsg.Call != nil || waMsg.Chat != nil ||
-		waMsg.HighlyStructuredMessage != nil || waMsg.SendPaymentMessage != nil || waMsg.LiveLocationMessage != nil ||
-		waMsg.RequestPaymentMessage != nil || waMsg.DeclinePaymentRequestMessage != nil ||
-		waMsg.CancelPaymentRequestMessage != nil || waMsg.TemplateMessage != nil ||
-		waMsg.TemplateButtonReplyMessage != nil || waMsg.ProductMessage != nil || waMsg.ListMessage != nil ||
-		waMsg.OrderMessage != nil || waMsg.ListResponseMessage != nil || waMsg.InvoiceMessage != nil ||
-		waMsg.ButtonsMessage != nil || waMsg.ButtonsResponseMessage != nil || waMsg.PaymentInviteMessage != nil ||
-		waMsg.InteractiveMessage != nil || waMsg.ReactionMessage != nil || waMsg.StickerSyncRmrMessage != nil
-}
-
 func getMessageType(waMsg *waProto.Message) string {
 	switch {
 	case waMsg == nil:
 		return "ignore"
-	case waMsg.Conversation != nil || waMsg.ExtendedTextMessage != nil:
+	case waMsg.Conversation != nil, waMsg.ExtendedTextMessage != nil:
 		return "text"
 	case waMsg.ImageMessage != nil:
 		return fmt.Sprintf("image %s", waMsg.GetImageMessage().GetMimetype())
@@ -312,20 +294,100 @@ func getMessageType(waMsg *waProto.Message) string {
 		return "live location start"
 	case waMsg.GroupInviteMessage != nil:
 		return "group invite"
+	case waMsg.ReactionMessage != nil:
+		return "reaction"
 	case waMsg.ProtocolMessage != nil:
 		switch waMsg.GetProtocolMessage().GetType() {
 		case waProto.ProtocolMessage_REVOKE:
 			return "revoke"
+		case waProto.ProtocolMessage_EPHEMERAL_SETTING:
+			return "disappearing timer change"
 		case waProto.ProtocolMessage_APP_STATE_SYNC_KEY_SHARE, waProto.ProtocolMessage_HISTORY_SYNC_NOTIFICATION, waProto.ProtocolMessage_INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC:
 			return "ignore"
 		default:
-			return "unknown_protocol"
+			return fmt.Sprintf("unknown_protocol_%d", waMsg.GetProtocolMessage().GetType())
 		}
-	case isPotentiallyInteresting(waMsg):
-		return "unknown"
-	default:
+	case waMsg.ButtonsMessage != nil:
+		return "buttons"
+	case waMsg.ButtonsResponseMessage != nil:
+		return "buttons response"
+	case waMsg.TemplateMessage != nil:
+		return "template"
+	case waMsg.HighlyStructuredMessage != nil:
+		return "highly structured template"
+	case waMsg.TemplateButtonReplyMessage != nil:
+		return "template button reply"
+	case waMsg.InteractiveMessage != nil:
+		return "interactive"
+	case waMsg.ListMessage != nil:
+		return "list"
+	case waMsg.ProductMessage != nil:
+		return "product"
+	case waMsg.ListResponseMessage != nil:
+		return "list response"
+	case waMsg.OrderMessage != nil:
+		return "order"
+	case waMsg.InvoiceMessage != nil:
+		return "invoice"
+	case waMsg.SendPaymentMessage != nil, waMsg.RequestPaymentMessage != nil,
+		waMsg.DeclinePaymentRequestMessage != nil, waMsg.CancelPaymentRequestMessage != nil,
+		waMsg.PaymentInviteMessage != nil:
+		return "payment"
+	case waMsg.Call != nil:
+		return "call"
+	case waMsg.Chat != nil:
+		return "chat"
+	case waMsg.SenderKeyDistributionMessage != nil, waMsg.StickerSyncRmrMessage != nil:
 		return "ignore"
+	default:
+		return "unknown"
 	}
+}
+
+func pluralUnit(val int, name string) string {
+	if val == 1 {
+		return fmt.Sprintf("%d %s", val, name)
+	} else if val == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d %ss", val, name)
+}
+
+func naturalJoin(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	} else if len(parts) == 1 {
+		return parts[0]
+	} else if len(parts) == 2 {
+		return fmt.Sprintf("%s and %s", parts[0], parts[1])
+	} else {
+		return fmt.Sprintf("%s and %s", strings.Join(parts[:len(parts)-1], ", "), parts[len(parts)-1])
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	const Day = time.Hour * 24
+
+	var days, hours, minutes, seconds int
+	days, d = int(d/Day), d%Day
+	hours, d = int(d/time.Hour), d%time.Hour
+	minutes, d = int(d/time.Minute), d%time.Minute
+	seconds = int(d / time.Second)
+
+	parts := make([]string, 0, 4)
+	if days > 0 {
+		parts = append(parts, pluralUnit(days, "day"))
+	}
+	if hours > 0 {
+		parts = append(parts, pluralUnit(hours, "hour"))
+	}
+	if minutes > 0 {
+		parts = append(parts, pluralUnit(seconds, "minute"))
+	}
+	if seconds > 0 {
+		parts = append(parts, pluralUnit(seconds, "second"))
+	}
+	return naturalJoin(parts)
 }
 
 func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, waMsg *waProto.Message) *ConvertedMessage {
@@ -352,8 +414,49 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 		return portal.convertLiveLocationMessage(intent, waMsg.GetLiveLocationMessage())
 	case waMsg.GroupInviteMessage != nil:
 		return portal.convertGroupInviteMessage(intent, info, waMsg.GetGroupInviteMessage())
+	case waMsg.ProtocolMessage != nil && waMsg.ProtocolMessage.GetType() == waProto.ProtocolMessage_EPHEMERAL_SETTING:
+		portal.ExpirationTime = waMsg.ProtocolMessage.GetEphemeralExpiration()
+		portal.Update()
+		return &ConvertedMessage{
+			Intent: intent,
+			Type:   event.EventMessage,
+			Content: &event.MessageEventContent{
+				Body:    portal.formatDisappearingMessageNotice(),
+				MsgType: event.MsgNotice,
+			},
+		}
 	default:
 		return nil
+	}
+}
+
+func (portal *Portal) UpdateGroupDisappearingMessages(sender *types.JID, timestamp time.Time, timer uint32) {
+	portal.ExpirationTime = timer
+	portal.Update()
+	intent := portal.MainIntent()
+	if sender != nil {
+		intent = portal.bridge.GetPuppetByJID(sender.ToNonAD()).IntentFor(portal)
+	} else {
+		sender = &types.EmptyJID
+	}
+	_, err := portal.sendMessage(intent, event.EventMessage, &event.MessageEventContent{
+		Body:    portal.formatDisappearingMessageNotice(),
+		MsgType: event.MsgNotice,
+	}, nil, timestamp.UnixMilli())
+	if err != nil {
+		portal.log.Warnfln("Failed to notify portal about disappearing message timer change by %s to %d", *sender, timer)
+	}
+}
+
+func (portal *Portal) formatDisappearingMessageNotice() string {
+	if portal.ExpirationTime == 0 {
+		return "Turned off disappearing messages"
+	} else {
+		msg := fmt.Sprintf("Set the disappearing message timer to %s", formatDuration(time.Duration(portal.ExpirationTime)*time.Second))
+		if !portal.bridge.Config.Bridge.DisappearingMessagesInGroups && portal.IsGroupChat() {
+			msg += ". However, this bridge is not configured to disappear messages in group chats."
+		}
+		return msg
 	}
 }
 
@@ -463,6 +566,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		}
 		var eventID id.EventID
 		if existingMsg != nil {
+			portal.MarkDisappearing(existingMsg.MXID, converted.ExpiresIn, false)
 			converted.Content.SetEdit(existingMsg.MXID)
 		} else if len(converted.ReplyTo) > 0 {
 			portal.SetReply(converted.Content, converted.ReplyTo)
@@ -471,6 +575,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		if err != nil {
 			portal.log.Errorfln("Failed to send %s to Matrix: %v", msgID, err)
 		} else {
+			portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
 			eventID = resp.EventID
 		}
 		// TODO figure out how to handle captions with undecryptable messages turning decryptable
@@ -479,6 +584,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			if err != nil {
 				portal.log.Errorfln("Failed to send caption of %s to Matrix: %v", msgID, err)
 			} else {
+				portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
 				eventID = resp.EventID
 			}
 		}
@@ -487,11 +593,13 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 				resp, err = portal.sendMessage(converted.Intent, converted.Type, subEvt, nil, evt.Info.Timestamp.UnixMilli())
 				if err != nil {
 					portal.log.Errorfln("Failed to send sub-event %d of %s to Matrix: %v", index+1, msgID, err)
+				} else {
+					portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
 				}
 			}
 		}
 		if len(eventID) != 0 {
-			portal.finishHandling(existingMsg, &evt.Info, resp.EventID, false)
+			portal.finishHandling(existingMsg, &evt.Info, eventID, false)
 		}
 	} else if msgType == "revoke" {
 		portal.HandleMessageRevoke(source, &evt.Info, evt.Message.GetProtocolMessage().GetKey())
@@ -502,7 +610,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			existingMsg.UpdateMXID("net.maunium.whatsapp.fake::"+existingMsg.MXID, false)
 		}
 	} else {
-		portal.log.Warnfln("Unhandled message: %+v / %+v", evt.Info, evt.Message)
+		portal.log.Warnfln("Unhandled message: %+v (%s)", evt.Info, msgType)
 		if existingMsg != nil {
 			_, _ = portal.MainIntent().RedactEvent(portal.MXID, existingMsg.MXID, mautrix.ReqRedact{
 				Reason: "The undecryptable message contained an unsupported message type",
@@ -803,6 +911,10 @@ func (portal *Portal) UpdateMetadata(user *User, groupInfo *types.GroupInfo) boo
 	update := false
 	update = portal.UpdateName(groupInfo.Name, groupInfo.NameSetBy, false) || update
 	update = portal.UpdateTopic(groupInfo.Topic, groupInfo.TopicSetBy, false) || update
+	if portal.ExpirationTime != groupInfo.DisappearingTimer {
+		update = true
+		portal.ExpirationTime = groupInfo.DisappearingTimer
+	}
 
 	portal.RestrictMessageSending(groupInfo.IsAnnounce)
 	portal.RestrictMetadataChanges(groupInfo.IsLocked)
@@ -1180,6 +1292,10 @@ func (portal *Portal) IsPrivateChat() bool {
 	return portal.Key.JID.Server == types.DefaultUserServer
 }
 
+func (portal *Portal) IsGroupChat() bool {
+	return portal.Key.JID.Server == types.GroupServer
+}
+
 func (portal *Portal) IsBroadcastList() bool {
 	return portal.Key.JID.Server == types.BroadcastServer
 }
@@ -1301,6 +1417,13 @@ func (portal *Portal) sendMessage(intent *appservice.IntentAPI, eventType event.
 	if err != nil {
 		return nil, err
 	}
+
+	if intent.IsCustomPuppet {
+		wrappedContent.Raw = map[string]interface{}{doublePuppetKey: doublePuppetValue}
+	} else {
+		wrappedContent.Raw = nil
+	}
+
 	_, _ = intent.UserTyping(portal.MXID, false, 0)
 	if timestamp == 0 {
 		return intent.SendMessageEvent(portal.MXID, eventType, &wrappedContent)
@@ -1318,7 +1441,8 @@ type ConvertedMessage struct {
 
 	MultiEvent []*event.MessageEventContent
 
-	ReplyTo types.MessageID
+	ReplyTo   types.MessageID
+	ExpiresIn uint32
 }
 
 func (portal *Portal) convertTextMessage(intent *appservice.IntentAPI, msg *waProto.Message) *ConvertedMessage {
@@ -1327,6 +1451,7 @@ func (portal *Portal) convertTextMessage(intent *appservice.IntentAPI, msg *waPr
 		MsgType: event.MsgText,
 	}
 	var replyTo types.MessageID
+	var expiresIn uint32
 	if msg.GetExtendedTextMessage() != nil {
 		content.Body = msg.GetExtendedTextMessage().GetText()
 
@@ -1335,9 +1460,16 @@ func (portal *Portal) convertTextMessage(intent *appservice.IntentAPI, msg *waPr
 			portal.bridge.Formatter.ParseWhatsApp(content, contextInfo.GetMentionedJid())
 			replyTo = contextInfo.GetStanzaId()
 		}
+		expiresIn = contextInfo.GetExpiration()
 	}
 
-	return &ConvertedMessage{Intent: intent, Type: event.EventMessage, Content: content, ReplyTo: replyTo}
+	return &ConvertedMessage{
+		Intent:    intent,
+		Type:      event.EventMessage,
+		Content:   content,
+		ReplyTo:   replyTo,
+		ExpiresIn: expiresIn,
+	}
 }
 
 func (portal *Portal) convertLiveLocationMessage(intent *appservice.IntentAPI, msg *waProto.LiveLocationMessage) *ConvertedMessage {
@@ -1349,10 +1481,11 @@ func (portal *Portal) convertLiveLocationMessage(intent *appservice.IntentAPI, m
 		content.Body += ": " + msg.GetCaption()
 	}
 	return &ConvertedMessage{
-		Intent:  intent,
-		Type:    event.EventMessage,
-		Content: content,
-		ReplyTo: msg.GetContextInfo().GetStanzaId(),
+		Intent:    intent,
+		Type:      event.EventMessage,
+		Content:   content,
+		ReplyTo:   msg.GetContextInfo().GetStanzaId(),
+		ExpiresIn: msg.GetContextInfo().GetExpiration(),
 	}
 }
 
@@ -1400,10 +1533,11 @@ func (portal *Portal) convertLocationMessage(intent *appservice.IntentAPI, msg *
 	}
 
 	return &ConvertedMessage{
-		Intent:  intent,
-		Type:    event.EventMessage,
-		Content: content,
-		ReplyTo: msg.GetContextInfo().GetStanzaId(),
+		Intent:    intent,
+		Type:      event.EventMessage,
+		Content:   content,
+		ReplyTo:   msg.GetContextInfo().GetStanzaId(),
+		ExpiresIn: msg.GetContextInfo().GetExpiration(),
 	}
 }
 
@@ -1428,11 +1562,12 @@ func (portal *Portal) convertGroupInviteMessage(intent *appservice.IntentAPI, in
 		},
 	}
 	return &ConvertedMessage{
-		Intent:  intent,
-		Type:    event.EventMessage,
-		Content: content,
-		Extra:   extraAttrs,
-		ReplyTo: msg.GetContextInfo().GetStanzaId(),
+		Intent:    intent,
+		Type:      event.EventMessage,
+		Content:   content,
+		Extra:     extraAttrs,
+		ReplyTo:   msg.GetContextInfo().GetStanzaId(),
+		ExpiresIn: msg.GetContextInfo().GetExpiration(),
 	}
 }
 
@@ -1464,10 +1599,11 @@ func (portal *Portal) convertContactMessage(intent *appservice.IntentAPI, msg *w
 	}
 
 	return &ConvertedMessage{
-		Intent:  intent,
-		Type:    event.EventMessage,
-		Content: content,
-		ReplyTo: msg.GetContextInfo().GetStanzaId(),
+		Intent:    intent,
+		Type:      event.EventMessage,
+		Content:   content,
+		ReplyTo:   msg.GetContextInfo().GetStanzaId(),
+		ExpiresIn: msg.GetContextInfo().GetExpiration(),
 	}
 }
 
@@ -1491,6 +1627,7 @@ func (portal *Portal) convertContactsArrayMessage(intent *appservice.IntentAPI, 
 			Body:    fmt.Sprintf("Sent %s", name),
 		},
 		ReplyTo:    msg.GetContextInfo().GetStanzaId(),
+		ExpiresIn:  msg.GetContextInfo().GetExpiration(),
 		MultiEvent: contacts,
 	}
 }
@@ -1647,32 +1784,6 @@ type MediaMessageWithDuration interface {
 	GetSeconds() uint32
 }
 
-// MimeExtensionSanityOverrides includes extensions for various common mimetypes.
-//
-// This is necessary because sometimes the OS mimetype database and Go interact in weird ways,
-// which causes very obscure extensions to be first in the array for common mimetypes
-// (e.g. image/jpeg -> .jpe, text/plain -> ,v).
-var MimeExtensionSanityOverrides = map[string]string{
-	"image/png":  ".png",
-	"image/webp": ".webp",
-	"image/jpeg": ".jpg",
-	"image/tiff": ".tiff",
-	"image/heif": ".heic",
-	"image/heic": ".heic",
-
-	"audio/mpeg": ".mp3",
-	"audio/ogg":  ".ogg",
-	"audio/webm": ".webm",
-	"video/mp4":  ".mp4",
-	"video/mpeg": ".mpeg",
-	"video/webm": ".webm",
-
-	"text/plain": ".txt",
-	"text/html":  ".html",
-
-	"application/xml": ".xml",
-}
-
 func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, msg MediaMessage) *ConvertedMessage {
 	messageWithCaption, ok := msg.(MediaMessageWithCaption)
 	var captionContent *event.MessageEventContent
@@ -1699,6 +1810,8 @@ func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *
 	if errors.Is(err, whatsmeow.ErrNoURLPresent) {
 		portal.log.Debugfln("No URL present error for media message %s, ignoring...", info.ID)
 		return nil
+	} else if errors.Is(err, whatsmeow.ErrFileLengthMismatch) || errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
+		portal.log.Warnfln("Mismatching media checksums in %s: %v. Ignoring because WhatsApp seems to ignore them too", info.ID, err)
 	} else if err != nil {
 		return portal.makeMediaBridgeFailureMessage(intent, info, err, captionContent)
 	}
@@ -1749,14 +1862,7 @@ func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *
 			content.Body = mimeClass
 		}
 
-		ext, ok := MimeExtensionSanityOverrides[strings.Split(msg.GetMimetype(), ";")[0]]
-		if !ok {
-			exts, _ := mime.ExtensionsByType(msg.GetMimetype())
-			if len(exts) > 0 {
-				ext = exts[0]
-			}
-		}
-		content.Body += ext
+		content.Body += util.ExtensionFromMimetype(msg.GetMimetype())
 	}
 
 	msgWithDuration, ok := msg.(MediaMessageWithDuration)
@@ -1815,12 +1921,25 @@ func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *
 		eventType = event.EventSticker
 	}
 
+	audioMessage, ok := msg.(*waProto.AudioMessage)
+	extraContent := map[string]interface{}{}
+	if ok {
+		extraContent["org.matrix.msc1767.audio"] = map[string]interface{}{
+			"duration": int(audioMessage.GetSeconds()) * 1000,
+		}
+		if audioMessage.GetPtt() {
+			extraContent["org.matrix.msc3245.voice"] = map[string]interface{}{}
+		}
+	}
+
 	return &ConvertedMessage{
-		Intent:  intent,
-		Type:    eventType,
-		Content: content,
-		Caption: captionContent,
-		ReplyTo: msg.GetContextInfo().GetStanzaId(),
+		Intent:    intent,
+		Type:      eventType,
+		Content:   content,
+		Caption:   captionContent,
+		ReplyTo:   msg.GetContextInfo().GetStanzaId(),
+		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		Extra:     extraContent,
 	}
 }
 
@@ -1895,53 +2014,6 @@ func (portal *Portal) convertWebPtoPNG(webpImage []byte) ([]byte, error) {
 	return pngBuffer.Bytes(), nil
 }
 
-func (portal *Portal) convertGifToVideo(gif []byte) ([]byte, error) {
-	dir, err := os.MkdirTemp("", "gif-convert-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to make temp dir: %w", err)
-	}
-	defer os.RemoveAll(dir)
-
-	inputFile, err := os.OpenFile(filepath.Join(dir, "input.gif"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("failed open input file: %w", err)
-	}
-	_, err = inputFile.Write(gif)
-	if err != nil {
-		_ = inputFile.Close()
-		return nil, fmt.Errorf("failed to write gif to input file: %w", err)
-	}
-	_ = inputFile.Close()
-
-	outputFileName := filepath.Join(dir, "output.mp4")
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "warning",
-		"-f", "gif", "-i", inputFile.Name(),
-		"-pix_fmt", "yuv420p", "-c:v", "libx264", "-movflags", "+faststart",
-		"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
-		outputFileName)
-	vcLog := portal.log.Sub("VideoConverter").Writer(log.LevelWarn)
-	cmd.Stdout = vcLog
-	cmd.Stderr = vcLog
-
-	err = cmd.Run()
-	if err != nil {
-		return nil, fmt.Errorf("failed to run ffmpeg: %w", err)
-	}
-	outputFile, err := os.OpenFile(filepath.Join(dir, "output.mp4"), os.O_RDONLY, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open output file: %w", err)
-	}
-	defer func() {
-		_ = outputFile.Close()
-		_ = os.Remove(outputFile.Name())
-	}()
-	mp4, err := io.ReadAll(outputFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read mp4 from output file: %w", err)
-	}
-	return mp4, nil
-}
-
 func (portal *Portal) preprocessMatrixMedia(sender *User, relaybotFormatted bool, content *event.MessageEventContent, eventID id.EventID, mediaType whatsmeow.MediaType) *MediaUpload {
 	var caption string
 	var mentionedJIDs []string
@@ -1973,7 +2045,10 @@ func (portal *Portal) preprocessMatrixMedia(sender *User, relaybotFormatted bool
 		}
 	}
 	if mediaType == whatsmeow.MediaVideo && content.GetInfo().MimeType == "image/gif" {
-		data, err = portal.convertGifToVideo(data)
+		data, err = ffmpeg.ConvertBytes(data, ".mp4", []string{"-f", "gif"}, []string{
+			"-pix_fmt", "yuv420p", "-c:v", "libx264", "-movflags", "+faststart",
+			"-filter:v", "crop='floor(in_w/2)*2:floor(in_h/2)*2'",
+		}, content.GetInfo().MimeType)
 		if err != nil {
 			portal.log.Errorfln("Failed to convert gif to mp4 in %s: %v", eventID, err)
 			return nil
@@ -2091,6 +2166,9 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 			ctxInfo.QuotedMessage = &waProto.Message{Conversation: proto.String("")}
 		}
 	}
+	if portal.ExpirationTime != 0 {
+		ctxInfo.Expiration = proto.Uint32(portal.ExpirationTime)
+	}
 	relaybotFormatted := false
 	if !sender.IsLoggedIn() || (portal.IsPrivateChat() && sender.JID.User != portal.Key.Receiver.User) {
 		if !portal.HasRelaybot() {
@@ -2119,7 +2197,7 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 		if content.MsgType == event.MsgEmote && !relaybotFormatted {
 			text = "/me " + text
 		}
-		if ctxInfo.StanzaId != nil || ctxInfo.MentionedJid != nil {
+		if ctxInfo.StanzaId != nil || ctxInfo.MentionedJid != nil || ctxInfo.Expiration != nil {
 			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
 				Text:        &text,
 				ContextInfo: &ctxInfo,
@@ -2271,6 +2349,7 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 	if msg == nil {
 		return
 	}
+	portal.MarkDisappearing(evt.ID, portal.ExpirationTime, true)
 	info := portal.generateMessageInfo(sender)
 	dbMsg := portal.markHandled(nil, info, evt.ID, false, true, false)
 	portal.log.Debugln("Sending event", evt.ID, "to WhatsApp", info.ID)
@@ -2377,6 +2456,7 @@ func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, 
 			portal.log.Warnfln("Failed to mark %v as read by %s: %v", ids, sender.JID, err)
 		}
 	}
+	portal.ScheduleDisappearing()
 }
 
 func typingDiff(prev, new []id.UserID) (started, stopped []id.UserID) {
