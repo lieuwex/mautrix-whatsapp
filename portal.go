@@ -139,6 +139,7 @@ func (bridge *Bridge) NewManualPortal(key database.PortalKey) *Portal {
 		log:    bridge.Log.Sub(fmt.Sprintf("Portal/%s", key)),
 
 		messages:       make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
+		receipts:       make(chan PortalReceipt, bridge.Config.Bridge.PortalMessageBuffer),
 		matrixMessages: make(chan PortalMatrixMessage, bridge.Config.Bridge.PortalMessageBuffer),
 	}
 	portal.Key = key
@@ -153,6 +154,7 @@ func (bridge *Bridge) NewPortal(dbPortal *database.Portal) *Portal {
 		log:    bridge.Log.Sub(fmt.Sprintf("Portal/%s", dbPortal.Key)),
 
 		messages:       make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
+		receipts:       make(chan PortalReceipt, bridge.Config.Bridge.PortalMessageBuffer),
 		matrixMessages: make(chan PortalMatrixMessage, bridge.Config.Bridge.PortalMessageBuffer),
 	}
 	go portal.handleMessageLoop()
@@ -174,6 +176,11 @@ type PortalMessage struct {
 	undecryptable *events.UndecryptableMessage
 	fake          *fakeMessage
 	source        *User
+}
+
+type PortalReceipt struct {
+	evt    *events.Receipt
+	source *User
 }
 
 type PortalMatrixMessage struct {
@@ -206,6 +213,7 @@ type Portal struct {
 	currentlyTypingLock sync.Mutex
 
 	messages       chan PortalMessage
+	receipts       chan PortalReceipt
 	matrixMessages chan PortalMatrixMessage
 
 	relayUser *User
@@ -237,6 +245,7 @@ func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
 }
 
 func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
+	portal.HandleMatrixReadReceipt(msg.user, "", time.UnixMilli(msg.evt.Timestamp), false)
 	switch msg.evt.Type {
 	case event.EventMessage, event.EventSticker:
 		portal.HandleMatrixMessage(msg.user, msg.evt)
@@ -247,11 +256,50 @@ func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
 	}
 }
 
+func (portal *Portal) handleReceipt(receipt *events.Receipt, source *User) {
+	// The order of the message ID array depends on the sender's platform, so we just have to find
+	// the last message based on timestamp. Also, timestamps only have second precision, so if
+	// there are many messages at the same second just mark them all as read, because we don't
+	// know which one is last
+	markAsRead := make([]*database.Message, 0, 1)
+	var bestTimestamp time.Time
+	for _, msgID := range receipt.MessageIDs {
+		msg := portal.bridge.DB.Message.GetByJID(portal.Key, msgID)
+		if msg == nil || msg.IsFakeMXID() {
+			continue
+		}
+		if msg.Timestamp.After(bestTimestamp) {
+			bestTimestamp = msg.Timestamp
+			markAsRead = append(markAsRead[:0], msg)
+		} else if msg != nil && msg.Timestamp.Equal(bestTimestamp) {
+			markAsRead = append(markAsRead, msg)
+		}
+	}
+	if receipt.Sender.User == source.JID.User {
+		if len(markAsRead) > 0 {
+			source.SetLastReadTS(portal.Key, markAsRead[0].Timestamp)
+		} else {
+			source.SetLastReadTS(portal.Key, receipt.Timestamp)
+		}
+	}
+	intent := portal.bridge.GetPuppetByJID(receipt.Sender).IntentFor(portal)
+	for _, msg := range markAsRead {
+		err := intent.SetReadMarkers(portal.MXID, makeReadMarkerContent(msg.MXID, intent.IsCustomPuppet))
+		if err != nil {
+			portal.log.Warnfln("Failed to mark message %s as read by %s: %v", msg.MXID, intent.UserID, err)
+		} else {
+			portal.log.Debugfln("Marked %s as read by %s", msg.MXID, intent.UserID)
+		}
+	}
+}
+
 func (portal *Portal) handleMessageLoop() {
 	for {
 		select {
 		case msg := <-portal.messages:
 			portal.handleMessageLoopItem(msg)
+		case receipt := <-portal.receipts:
+			portal.handleReceipt(receipt.evt, receipt.source)
 		case msg := <-portal.matrixMessages:
 			portal.handleMatrixMessageLoopItem(msg)
 		}
@@ -742,7 +790,7 @@ func (portal *Portal) SyncParticipants(source *User, metadata *types.GroupInfo) 
 		puppet := portal.bridge.GetPuppetByJID(participant.JID)
 		puppet.SyncContact(source, true, "group participant")
 		user := portal.bridge.GetUserByJID(participant.JID)
-		if user != nil {
+		if user != nil && user != source {
 			portal.ensureUserInvited(user)
 		}
 		if user == nil || !puppet.IntentFor(portal).IsCustomPuppet {
@@ -809,7 +857,7 @@ func (portal *Portal) UpdateAvatar(user *User, setBy types.JID, updateInfo bool)
 			_, err = portal.MainIntent().SetRoomAvatar(portal.MXID, portal.AvatarURL)
 		}
 		if err != nil {
-			portal.log.Warnln("Failed to set room topic:", err)
+			portal.log.Warnln("Failed to set room avatar:", err)
 			return false
 		}
 	}
@@ -2411,20 +2459,27 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	}
 }
 
-func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, receiptTimestamp time.Time) {
+func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, receiptTimestamp time.Time, isExplicit bool) {
 	if !sender.IsLoggedIn() {
-		portal.log.Debugfln("Ignoring read receipt by %s: user is not connected to WhatsApp", sender.JID)
+		if isExplicit {
+			portal.log.Debugfln("Ignoring read receipt by %s: user is not connected to WhatsApp", sender.JID)
+		}
 		return
 	}
 
 	maxTimestamp := receiptTimestamp
-	if message := portal.bridge.DB.Message.GetByMXID(eventID); message != nil {
-		maxTimestamp = message.Timestamp
+	// Implicit read receipts don't have an event ID that's already bridged
+	if isExplicit {
+		if message := portal.bridge.DB.Message.GetByMXID(eventID); message != nil {
+			maxTimestamp = message.Timestamp
+		}
 	}
 
 	prevTimestamp := sender.GetLastReadTS(portal.Key)
+	lastReadIsZero := false
 	if prevTimestamp.IsZero() {
 		prevTimestamp = maxTimestamp.Add(-2 * time.Second)
+		lastReadIsZero = true
 	}
 
 	messages := portal.bridge.DB.Message.GetMessagesBetween(portal.Key, prevTimestamp, maxTimestamp)
@@ -2444,7 +2499,11 @@ func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, 
 		} // else: blank key (participant field isn't needed in direct chat read receipts)
 		groupedMessages[key] = append(groupedMessages[key], msg.JID)
 	}
-	portal.log.Debugfln("Sending read receipts by %s: %v", sender.JID, groupedMessages)
+	// For explicit read receipts, log even if there are no targets. For implicit ones only log when there are targets
+	if len(groupedMessages) > 0 || isExplicit {
+		portal.log.Debugfln("Sending read receipts by %s (last read: %d, was zero: %t, explicit: %t): %v",
+			sender.JID, prevTimestamp.Unix(), lastReadIsZero, isExplicit, groupedMessages)
+	}
 	for messageSender, ids := range groupedMessages {
 		chatJID := portal.Key.JID
 		if messageSender.Server == types.BroadcastServer {
@@ -2456,7 +2515,9 @@ func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, 
 			portal.log.Warnfln("Failed to mark %v as read by %s: %v", ids, sender.JID, err)
 		}
 	}
-	portal.ScheduleDisappearing()
+	if isExplicit {
+		portal.ScheduleDisappearing()
+	}
 }
 
 func typingDiff(prev, new []id.UserID) (started, stopped []id.UserID) {

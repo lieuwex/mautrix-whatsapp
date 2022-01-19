@@ -200,6 +200,7 @@ func (user *User) ensureInvited(intent *appservice.IntentAPI, roomID id.RoomID, 
 	if err != nil && errors.As(err, &httpErr) && httpErr.RespError != nil && strings.Contains(httpErr.RespError.Err, "is already in the room") {
 		user.bridge.StateStore.SetMembership(roomID, user.MXID, event.MembershipJoin)
 		ok = true
+		return
 	} else if err != nil {
 		user.log.Warnfln("Failed to invite user to %s: %v", roomID, err)
 	} else {
@@ -207,7 +208,7 @@ func (user *User) ensureInvited(intent *appservice.IntentAPI, roomID id.RoomID, 
 	}
 
 	if customPuppet != nil && customPuppet.CustomIntent() != nil {
-		err = customPuppet.CustomIntent().EnsureJoined(roomID)
+		err = customPuppet.CustomIntent().EnsureJoined(roomID, appservice.EnsureJoinedParams{IgnoreCache: true})
 		if err != nil {
 			user.log.Warnfln("Failed to auto-join %s: %v", roomID, err)
 			ok = false
@@ -658,6 +659,12 @@ type CustomReadReceipt struct {
 	DoublePuppetSource string `json:"fi.mau.double_puppet_source,omitempty"`
 }
 
+type CustomReadMarkers struct {
+	mautrix.ReqSetReadMarkers
+	ReadExtra      CustomReadReceipt `json:"com.beeper.read.extra"`
+	FullyReadExtra CustomReadReceipt `json:"com.beeper.fully_read.extra"`
+}
+
 func (user *User) syncChatDoublePuppetDetails(portal *Portal, justCreated bool) {
 	doublePuppet := portal.bridge.GetPuppetByCustomMXID(user.MXID)
 	if doublePuppet == nil {
@@ -745,6 +752,7 @@ func (user *User) UpdateDirectChats(chats map[id.UserID][]id.RoomID) {
 }
 
 func (user *User) handleLoggedOut(onConnect bool) {
+	user.sendBridgeState(BridgeState{StateEvent: StateBadCredentials, Error: WANotLoggedIn})
 	user.JID = types.EmptyJID
 	user.Update()
 	if onConnect {
@@ -752,7 +760,6 @@ func (user *User) handleLoggedOut(onConnect bool) {
 	} else {
 		user.sendMarkdownBridgeAlert("You were logged out from another device. Please link the bridge to your phone again.")
 	}
-	user.sendBridgeState(BridgeState{StateEvent: StateBadCredentials, Error: WANotLoggedIn})
 }
 
 func (user *User) GetPortalByMessageSource(ms types.MessageSource) *Portal {
@@ -844,43 +851,21 @@ func (user *User) handleReceipt(receipt *events.Receipt) {
 	if portal == nil || len(portal.MXID) == 0 {
 		return
 	}
-	// The order of the message ID array depends on the sender's platform, so we just have to find
-	// the last message based on timestamp. Also, timestamps only have second precision, so if
-	// there are many messages at the same second just mark them all as read, because we don't
-	// know which one is last
-	markAsRead := make([]*database.Message, 0, 1)
-	var bestTimestamp time.Time
-	for _, msgID := range receipt.MessageIDs {
-		msg := user.bridge.DB.Message.GetByJID(portal.Key, msgID)
-		if msg == nil || msg.IsFakeMXID() {
-			continue
-		}
-		if msg.Timestamp.After(bestTimestamp) {
-			bestTimestamp = msg.Timestamp
-			markAsRead = append(markAsRead[:0], msg)
-		} else if msg != nil && msg.Timestamp.Equal(bestTimestamp) {
-			markAsRead = append(markAsRead, msg)
-		}
+	portal.receipts <- PortalReceipt{evt: receipt, source: user}
+}
+
+func makeReadMarkerContent(eventID id.EventID, doublePuppet bool) CustomReadMarkers {
+	var extra CustomReadReceipt
+	if doublePuppet {
+		extra.DoublePuppetSource = doublePuppetValue
 	}
-	if receipt.Sender.User == user.JID.User {
-		if len(markAsRead) > 0 {
-			user.SetLastReadTS(portal.Key, markAsRead[0].Timestamp)
-		} else {
-			user.SetLastReadTS(portal.Key, receipt.Timestamp)
-		}
-	}
-	intent := user.bridge.GetPuppetByJID(receipt.Sender).IntentFor(portal)
-	var rrContent CustomReadReceipt
-	if intent.IsCustomPuppet {
-		rrContent.DoublePuppetSource = doublePuppetValue
-	}
-	for _, msg := range markAsRead {
-		err := intent.MarkReadWithContent(portal.MXID, msg.MXID, &rrContent)
-		if err != nil {
-			user.log.Warnfln("Failed to mark message %s as read by %s: %v", msg.MXID, intent.UserID, err)
-		} else {
-			user.log.Debugfln("Marked %s as read by %s", msg.MXID, intent.UserID)
-		}
+	return CustomReadMarkers{
+		ReqSetReadMarkers: mautrix.ReqSetReadMarkers{
+			Read:      eventID,
+			FullyRead: eventID,
+		},
+		ReadExtra:      extra,
+		FullyReadExtra: extra,
 	}
 }
 
@@ -894,9 +879,11 @@ func (user *User) markSelfReadFull(portal *Portal) {
 		return
 	}
 	user.SetLastReadTS(portal.Key, lastMessage.Timestamp)
-	err := puppet.CustomIntent().MarkReadWithContent(portal.MXID, lastMessage.MXID, &CustomReadReceipt{DoublePuppetSource: doublePuppetValue})
+	err := puppet.CustomIntent().SetReadMarkers(portal.MXID, makeReadMarkerContent(lastMessage.MXID, true))
 	if err != nil {
 		user.log.Warnfln("Failed to mark %s (last message) in %s as read: %v", lastMessage.MXID, portal.MXID, err)
+	} else {
+		user.log.Debugfln("Marked %s (last message) in %s as read", lastMessage.MXID, portal.MXID)
 	}
 }
 
