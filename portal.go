@@ -359,6 +359,9 @@ func getMessageType(waMsg *waProto.Message) string {
 	case waMsg.ProtocolMessage != nil:
 		switch waMsg.GetProtocolMessage().GetType() {
 		case waProto.ProtocolMessage_REVOKE:
+			if waMsg.GetProtocolMessage().GetKey() == nil {
+				return "ignore"
+			}
 			return "revoke"
 		case waProto.ProtocolMessage_EPHEMERAL_SETTING:
 			return "disappearing timer change"
@@ -1519,7 +1522,7 @@ func (portal *Portal) convertTextMessage(intent *appservice.IntentAPI, source *U
 	}
 
 	contextInfo := msg.GetExtendedTextMessage().GetContextInfo()
-	portal.bridge.Formatter.ParseWhatsApp(content, contextInfo.GetMentionedJid())
+	portal.bridge.Formatter.ParseWhatsApp(portal.MXID, content, contextInfo.GetMentionedJid())
 	replyTo := contextInfo.GetStanzaId()
 	expiresIn := contextInfo.GetExpiration()
 	extraAttrs := map[string]interface{}{}
@@ -2004,7 +2007,7 @@ func (portal *Portal) convertMediaMessageContent(intent *appservice.IntentAPI, m
 			MsgType: event.MsgNotice,
 		}
 
-		portal.bridge.Formatter.ParseWhatsApp(captionContent, msg.GetContextInfo().GetMentionedJid())
+		portal.bridge.Formatter.ParseWhatsApp(portal.MXID, captionContent, msg.GetContextInfo().GetMentionedJid())
 	}
 
 	return &ConvertedMessage{
@@ -2494,14 +2497,14 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*waP
 		if content.MsgType == event.MsgEmote && !relaybotFormatted {
 			text = "/me " + text
 		}
-		if ctxInfo.StanzaId != nil || ctxInfo.MentionedJid != nil || ctxInfo.Expiration != nil || evt.Content.Raw["com.beeper.linkpreviews"] != nil {
-			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
-				Text:        &text,
-				ContextInfo: &ctxInfo,
-			}
-
-			portal.convertURLPreviewToWhatsApp(sender, evt, msg.ExtendedTextMessage)
-		} else {
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text:        &text,
+			ContextInfo: &ctxInfo,
+		}
+		hasPreview := portal.convertURLPreviewToWhatsApp(sender, evt, msg.ExtendedTextMessage)
+		if ctxInfo.StanzaId == nil && ctxInfo.MentionedJid == nil && ctxInfo.Expiration == nil && !hasPreview {
+			// No need for extended message
+			msg.ExtendedTextMessage = nil
 			msg.Conversation = &text
 		}
 	case event.MsgImage:
@@ -2821,7 +2824,7 @@ func (portal *Portal) canBridgeFrom(sender *User, evtType string) bool {
 		if portal.HasRelaybot() {
 			return true
 		} else if sender.Session != nil {
-			portal.log.Debugln("Ignoring %s from %s as user is not connected", evtType, sender.MXID)
+			portal.log.Debugfln("Ignoring %s from %s as user is not connected", evtType, sender.MXID)
 			msg := format.RenderMarkdown(fmt.Sprintf("\u26a0 You are not connected to WhatsApp, so your %s was not bridged.", evtType), true, false)
 			msg.MsgType = event.MsgNotice
 			_, err := portal.sendMainIntentMessage(&msg)
