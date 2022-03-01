@@ -1,5 +1,5 @@
 // mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
-// Copyright (C) 2021 Tulir Asokan
+// Copyright (C) 2022 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -40,6 +40,8 @@ func (helper *UpgradeHelper) doUpgrade() {
 	helper.Copy(Str, "appservice", "database", "uri")
 	helper.Copy(Int, "appservice", "database", "max_open_conns")
 	helper.Copy(Int, "appservice", "database", "max_idle_conns")
+	helper.Copy(Str|Null, "appservice", "database", "max_conn_idle_time")
+	helper.Copy(Str|Null, "appservice", "database", "max_conn_lifetime")
 	helper.Copy(Str, "appservice", "provisioning", "prefix")
 	if secret, ok := helper.Get(Str, "appservice", "provisioning", "shared_secret"); !ok || secret == "generate" {
 		sharedSecret := appservice.RandomString(64)
@@ -80,6 +82,7 @@ func (helper *UpgradeHelper) doUpgrade() {
 	helper.Copy(Bool, "bridge", "sync_direct_chat_list")
 	helper.Copy(Bool, "bridge", "default_bridge_receipts")
 	helper.Copy(Bool, "bridge", "default_bridge_presence")
+	helper.Copy(Bool, "bridge", "force_active_delivery_receipts")
 	helper.Copy(Map, "bridge", "double_puppet_server_map")
 	helper.Copy(Bool, "bridge", "double_puppet_allow_discovery")
 	if legacySecret, ok := helper.Get(Str, "bridge", "login_shared_secret"); ok && len(legacySecret) > 0 {
