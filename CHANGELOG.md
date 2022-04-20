@@ -1,8 +1,17 @@
 # unreleased
 
+* Switched from `/r0` to `/v3` paths everywhere.
+  * The new `v3` paths are implemented since Synapse 1.48, Dendrite 0.6.5,
+    and Conduit 0.4.0. Servers older than these are no longer supported.
+* Added new deferred backfill system to allow backfilling historical messages
+  later instead of doing everything at login.
+
+# v0.3.1 (2022-04-16)
+
 * Added emoji normalization for reactions in both directions to add/remove
   variation selector 16 as appropriate.
 * Added option to use [MSC2246] async media uploads.
+* Fixed custom fields in messages being unencrypted in history syncs.
 
 [MSC2246]: https://github.com/matrix-org/matrix-spec-proposals/pull/2246
 

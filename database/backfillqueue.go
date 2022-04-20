@@ -19,6 +19,7 @@ package database
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	log "maunium.net/go/maulogger/v2"
@@ -30,7 +31,20 @@ type BackfillType int
 const (
 	BackfillImmediate BackfillType = 0
 	BackfillDeferred               = 1
+	BackfillMedia                  = 2
 )
+
+func (bt BackfillType) String() string {
+	switch bt {
+	case BackfillImmediate:
+		return "IMMEDIATE"
+	case BackfillDeferred:
+		return "DEFERRED"
+	case BackfillMedia:
+		return "MEDIA"
+	}
+	return "UNKNOWN"
+}
 
 type BackfillQuery struct {
 	db  *Database
@@ -64,16 +78,16 @@ func (bq *BackfillQuery) NewWithValues(userID id.UserID, backfillType BackfillTy
 const (
 	getNextBackfillQuery = `
 		SELECT queue_id, user_mxid, type, priority, portal_jid, portal_receiver, time_start, time_end, max_batch_events, max_total_events, batch_delay
-		  FROM backfill_queue
-		 WHERE user_mxid=$1
-		   AND type=$2
-		   AND completed_at IS NULL
-	  ORDER BY priority, queue_id
-	     LIMIT 1
+		FROM backfill_queue
+		WHERE user_mxid=$1
+			AND type=$2
+			AND completed_at IS NULL
+		ORDER BY priority, queue_id
+		LIMIT 1
 	`
 )
 
-/// Returns the next backfill to perform
+// GetNext returns the next backfill to perform
 func (bq *BackfillQuery) GetNext(userID id.UserID, backfillType BackfillType) (backfill *Backfill) {
 	rows, err := bq.db.Query(getNextBackfillQuery, userID, backfillType)
 	defer rows.Close()
@@ -108,6 +122,12 @@ type Backfill struct {
 	MaxTotalEvents int
 	BatchDelay     int
 	CompletedAt    *time.Time
+}
+
+func (b *Backfill) String() string {
+	return fmt.Sprintf("Backfill{QueueID: %d, UserID: %s, BackfillType: %s, Priority: %d, Portal: %s, TimeStart: %s, TimeEnd: %s, MaxBatchEvents: %d, MaxTotalEvents: %d, BatchDelay: %d, CompletedAt: %s}",
+		b.QueueID, b.UserID, b.BackfillType, b.Priority, b.Portal, b.TimeStart, b.TimeEnd, b.MaxBatchEvents, b.MaxTotalEvents, b.BatchDelay, b.CompletedAt,
+	)
 }
 
 func (b *Backfill) Scan(row Scannable) *Backfill {

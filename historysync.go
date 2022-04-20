@@ -78,31 +78,57 @@ func (user *User) handleHistorySyncsLoop() {
 
 func (user *User) handleBackfillRequestsLoop(backfillRequests chan *database.Backfill) {
 	for req := range backfillRequests {
-		user.log.Infof("Backfill request: %v", req)
+		user.log.Debugfln("Handling backfill request %s", req)
 		conv := user.bridge.DB.HistorySyncQuery.GetConversation(user.MXID, req.Portal)
 		if conv == nil {
-			user.log.Errorf("Could not find conversation for %s in %s", user.MXID, req.Portal.String())
+			user.log.Debugfln("Could not find history sync conversation data for %s", req.Portal.String())
 			continue
 		}
-
-		// Update the client store with basic chat settings.
-		if conv.MuteEndTime.After(time.Now()) {
-			user.Client.Store.ChatSettings.PutMutedUntil(conv.PortalKey.JID, conv.MuteEndTime)
-		}
-		if conv.Archived {
-			user.Client.Store.ChatSettings.PutArchived(conv.PortalKey.JID, true)
-		}
-		if conv.Pinned > 0 {
-			user.Client.Store.ChatSettings.PutPinned(conv.PortalKey.JID, true)
-		}
-
 		portal := user.GetPortalByJID(conv.PortalKey.JID)
-		if conv.EphemeralExpiration != nil && portal.ExpirationTime != *conv.EphemeralExpiration {
-			portal.ExpirationTime = *conv.EphemeralExpiration
-			portal.Update()
-		}
 
-		user.createOrUpdatePortalAndBackfillWithLock(req, conv, portal)
+		if req.BackfillType == database.BackfillMedia {
+			startTime := time.Unix(0, 0)
+			if req.TimeStart != nil {
+				startTime = *req.TimeStart
+			}
+			endTime := time.Now()
+			if req.TimeEnd != nil {
+				endTime = *req.TimeEnd
+			}
+
+			user.log.Debugfln("Backfilling media from %v to %v for %s", startTime, endTime, portal.Key.String())
+
+			// Go through all of the messages in the given time range,
+			// requesting any media that errored.
+			requested := 0
+			for _, msg := range user.bridge.DB.Message.GetMessagesBetween(portal.Key, startTime, endTime) {
+				if requested > 0 && requested%req.MaxBatchEvents == 0 {
+					time.Sleep(time.Duration(req.BatchDelay) * time.Second)
+				}
+				if msg.Error == database.MsgErrMediaNotFound {
+					portal.requestMediaRetry(user, msg.MXID)
+					requested += 1
+				}
+			}
+		} else {
+			// Update the client store with basic chat settings.
+			if conv.MuteEndTime.After(time.Now()) {
+				user.Client.Store.ChatSettings.PutMutedUntil(conv.PortalKey.JID, conv.MuteEndTime)
+			}
+			if conv.Archived {
+				user.Client.Store.ChatSettings.PutArchived(conv.PortalKey.JID, true)
+			}
+			if conv.Pinned > 0 {
+				user.Client.Store.ChatSettings.PutPinned(conv.PortalKey.JID, true)
+			}
+
+			if conv.EphemeralExpiration != nil && portal.ExpirationTime != *conv.EphemeralExpiration {
+				portal.ExpirationTime = *conv.EphemeralExpiration
+				portal.Update()
+			}
+
+			user.createOrUpdatePortalAndBackfillWithLock(req, conv, portal)
+		}
 	}
 }
 
@@ -114,57 +140,52 @@ func (user *User) createOrUpdatePortalAndBackfillWithLock(req *database.Backfill
 		return
 	}
 
+	allMsgs := user.bridge.DB.HistorySyncQuery.GetMessagesBetween(user.MXID, conv.ConversationID, req.TimeStart, req.TimeEnd, req.MaxTotalEvents)
+	if len(allMsgs) == 0 {
+		user.log.Debugfln("Not backfilling %s: no bridgeable messages found", portal.Key.JID)
+		return
+	}
+
 	if len(portal.MXID) == 0 {
 		user.log.Debugln("Creating portal for", portal.Key.JID, "as part of history sync handling")
 		err := portal.CreateMatrixRoom(user, nil, true, false)
 		if err != nil {
-			user.log.Warnfln("Failed to create room for %s during backfill: %v", portal.Key.JID, err)
+			user.log.Errorfln("Failed to create room for %s during backfill: %v", portal.Key.JID, err)
 			return
 		}
-	} else {
-		portal.UpdateMatrixRoom(user, nil)
 	}
 
-	allMsgs := user.bridge.DB.HistorySyncQuery.GetMessagesBetween(user.MXID, conv.ConversationID, req.TimeStart, req.TimeEnd, req.MaxTotalEvents)
-
-	if len(allMsgs) > 0 {
-		user.log.Debugf("Backfilling %d messages in %s, %d messages at a time", len(allMsgs), portal.Key.JID, req.MaxBatchEvents)
-		toBackfill := allMsgs[0:]
-		insertionEventIds := []id.EventID{}
-		for {
-			if len(toBackfill) == 0 {
-				break
-			}
-
-			var msgs []*waProto.WebMessageInfo
-			if len(toBackfill) <= req.MaxBatchEvents {
-				msgs = toBackfill
-				toBackfill = toBackfill[0:0]
-			} else {
-				msgs = toBackfill[len(toBackfill)-req.MaxBatchEvents:]
-				toBackfill = toBackfill[:len(toBackfill)-req.MaxBatchEvents]
-			}
-
-			if len(msgs) > 0 {
-				time.Sleep(time.Duration(req.BatchDelay) * time.Second)
-				user.log.Debugf("Backfilling %d messages in %s", len(msgs), portal.Key.JID)
-				insertionEventIds = append(insertionEventIds, portal.backfill(user, msgs)...)
-			}
+	user.log.Debugfln("Backfilling %d messages in %s, %d messages at a time", len(allMsgs), portal.Key.JID, req.MaxBatchEvents)
+	toBackfill := allMsgs[0:]
+	var insertionEventIds []id.EventID
+	for len(toBackfill) > 0 {
+		var msgs []*waProto.WebMessageInfo
+		if len(toBackfill) <= req.MaxBatchEvents {
+			msgs = toBackfill
+			toBackfill = nil
+		} else {
+			msgs = toBackfill[:req.MaxBatchEvents]
+			toBackfill = toBackfill[req.MaxBatchEvents:]
 		}
-		user.log.Debugf("Finished backfilling %d messages in %s", len(allMsgs), portal.Key.JID)
-		if len(insertionEventIds) > 0 {
-			portal.sendPostBackfillDummy(
-				time.Unix(int64(allMsgs[len(allMsgs)-1].GetMessageTimestamp()), 0),
-				insertionEventIds[0])
+
+		if len(msgs) > 0 {
+			time.Sleep(time.Duration(req.BatchDelay) * time.Second)
+			user.log.Debugfln("Backfilling %d messages in %s (queue ID: %d)", len(msgs), portal.Key.JID, req.QueueID)
+			insertionEventIds = append(insertionEventIds, portal.backfill(user, msgs)...)
 		}
-		user.log.Debugf("Deleting %d history sync messages after backfilling", len(allMsgs))
-		err := user.bridge.DB.HistorySyncQuery.DeleteMessages(user.MXID, conv.ConversationID, allMsgs)
-		if err != nil {
-			user.log.Warnf("Failed to delete %d history sync messages after backfilling: %v", len(allMsgs), err)
-		}
-	} else {
-		user.log.Debugfln("Not backfilling %s: no bridgeable messages found", portal.Key.JID)
 	}
+	user.log.Debugfln("Finished backfilling %d messages in %s (queue ID: %d)", len(allMsgs), portal.Key.JID, req.QueueID)
+	if len(insertionEventIds) > 0 {
+		portal.sendPostBackfillDummy(
+			time.Unix(int64(allMsgs[0].GetMessageTimestamp()), 0),
+			insertionEventIds[0])
+	}
+	user.log.Debugfln("Deleting %d history sync messages after backfilling", len(allMsgs))
+	err := user.bridge.DB.HistorySyncQuery.DeleteMessages(user.MXID, conv.ConversationID, allMsgs)
+	if err != nil {
+		user.log.Warnfln("Failed to delete %d history sync messages after backfilling: %v", len(allMsgs), err)
+	}
+
 	if !conv.MarkedAsUnread && conv.UnreadCount == 0 {
 		user.markSelfReadFull(portal)
 	}
@@ -190,13 +211,16 @@ func (user *User) handleHistorySync(reCheckQueue chan bool, evt *waProto.History
 	if evt == nil || evt.SyncType == nil || evt.GetSyncType() == waProto.HistorySync_INITIAL_STATUS_V3 || evt.GetSyncType() == waProto.HistorySync_PUSH_NAME {
 		return
 	}
-	description := fmt.Sprintf("type %s, %d conversations, chunk order %d", evt.GetSyncType(), len(evt.GetConversations()), evt.GetChunkOrder())
+	description := fmt.Sprintf("type %s, %d conversations, chunk order %d, progress: %d", evt.GetSyncType(), len(evt.GetConversations()), evt.GetChunkOrder(), evt.GetProgress())
 	user.log.Infoln("Storing history sync with", description)
 
 	for _, conv := range evt.GetConversations() {
 		jid, err := types.ParseJID(conv.GetId())
 		if err != nil {
 			user.log.Warnfln("Failed to parse chat JID '%s' in history sync: %v", conv.GetId(), err)
+			continue
+		} else if jid.Server == types.BroadcastServer {
+			user.log.Debugfln("Skipping broadcast list %s in history sync", jid)
 			continue
 		}
 		portal := user.GetPortalByJID(jid)
@@ -231,7 +255,7 @@ func (user *User) handleHistorySync(reCheckQueue chan bool, evt *waProto.History
 
 			message, err := user.bridge.DB.HistorySyncQuery.NewMessageWithValues(user.MXID, conv.GetId(), msg.Message.GetKey().GetId(), msg)
 			if err != nil {
-				user.log.Warnf("Failed to save message %s in %s. Error: %+v", msg.Message.Key.Id, conv.GetId(), err)
+				user.log.Warnfln("Failed to save message %s in %s. Error: %+v", msg.Message.Key.Id, conv.GetId(), err)
 				continue
 			}
 			message.Insert()
@@ -241,9 +265,14 @@ func (user *User) handleHistorySync(reCheckQueue chan bool, evt *waProto.History
 	// If this was the initial bootstrap, enqueue immediate backfills for the
 	// most recent portals. If it's the last history sync event, start
 	// backfilling the rest of the history of the portals.
-	if user.bridge.Config.Bridge.HistorySync.Backfill && (evt.GetSyncType() == waProto.HistorySync_INITIAL_BOOTSTRAP || evt.GetSyncType() == waProto.HistorySync_FULL || evt.GetSyncType() == waProto.HistorySync_RECENT) {
+	if user.bridge.Config.Bridge.HistorySync.Backfill {
+		if evt.GetSyncType() != waProto.HistorySync_INITIAL_BOOTSTRAP && evt.GetProgress() < 98 {
+			return
+		}
+
 		nMostRecent := user.bridge.DB.HistorySyncQuery.GetNMostRecentConversations(user.MXID, user.bridge.Config.Bridge.HistorySync.MaxInitialConversations)
-		for i, conv := range nMostRecent {
+		var priorityCounter int
+		for _, conv := range nMostRecent {
 			jid, err := types.ParseJID(conv.ConversationID)
 			if err != nil {
 				user.log.Warnfln("Failed to parse chat JID '%s' in history sync: %v", conv.ConversationID, err)
@@ -254,12 +283,11 @@ func (user *User) handleHistorySync(reCheckQueue chan bool, evt *waProto.History
 			switch evt.GetSyncType() {
 			case waProto.HistorySync_INITIAL_BOOTSTRAP:
 				// Enqueue immediate backfills for the most recent messages first.
-				user.EnqueueImmedateBackfill(portal, i)
+				user.EnqueueImmedateBackfill(portal, &priorityCounter)
 			case waProto.HistorySync_FULL, waProto.HistorySync_RECENT:
-				if evt.GetProgress() >= 99 {
-					// Enqueue deferred backfills as configured.
-					user.EnqueueDeferredBackfills(portal, len(nMostRecent), i)
-				}
+				// Enqueue deferred backfills as configured.
+				user.EnqueueDeferredBackfills(portal, &priorityCounter)
+				user.EnqueueMediaBackfills(portal, &priorityCounter)
 			}
 		}
 
@@ -276,22 +304,38 @@ func getConversationTimestamp(conv *waProto.Conversation) uint64 {
 	return convTs
 }
 
-func (user *User) EnqueueImmedateBackfill(portal *Portal, priority int) {
+func (user *User) EnqueueImmedateBackfill(portal *Portal, priorityCounter *int) {
 	maxMessages := user.bridge.Config.Bridge.HistorySync.Immediate.MaxEvents
-	initialBackfill := user.bridge.DB.BackfillQuery.NewWithValues(user.MXID, database.BackfillImmediate, priority, &portal.Key, nil, nil, maxMessages, maxMessages, 0)
+	initialBackfill := user.bridge.DB.BackfillQuery.NewWithValues(user.MXID, database.BackfillImmediate, *priorityCounter, &portal.Key, nil, nil, maxMessages, maxMessages, 0)
 	initialBackfill.Insert()
+	*priorityCounter++
 }
 
-func (user *User) EnqueueDeferredBackfills(portal *Portal, numConversations, priority int) {
-	for j, backfillStage := range user.bridge.Config.Bridge.HistorySync.Deferred {
+func (user *User) EnqueueDeferredBackfills(portal *Portal, priorityCounter *int) {
+	for _, backfillStage := range user.bridge.Config.Bridge.HistorySync.Deferred {
+		var startDate *time.Time = nil
+		if backfillStage.StartDaysAgo > 0 {
+			startDaysAgo := time.Now().AddDate(0, 0, -backfillStage.StartDaysAgo)
+			startDate = &startDaysAgo
+		}
+		backfillMessages := user.bridge.DB.BackfillQuery.NewWithValues(
+			user.MXID, database.BackfillDeferred, *priorityCounter, &portal.Key, startDate, nil, backfillStage.MaxBatchEvents, -1, backfillStage.BatchDelay)
+		backfillMessages.Insert()
+		*priorityCounter++
+	}
+}
+
+func (user *User) EnqueueMediaBackfills(portal *Portal, priorityCounter *int) {
+	for _, backfillStage := range user.bridge.Config.Bridge.HistorySync.Media {
 		var startDate *time.Time = nil
 		if backfillStage.StartDaysAgo > 0 {
 			startDaysAgo := time.Now().AddDate(0, 0, -backfillStage.StartDaysAgo)
 			startDate = &startDaysAgo
 		}
 		backfill := user.bridge.DB.BackfillQuery.NewWithValues(
-			user.MXID, database.BackfillDeferred, j*numConversations+priority, &portal.Key, startDate, nil, backfillStage.MaxBatchEvents, -1, backfillStage.BatchDelay)
+			user.MXID, database.BackfillMedia, *priorityCounter, &portal.Key, startDate, nil, backfillStage.MaxBatchEvents, -1, backfillStage.BatchDelay)
 		backfill.Insert()
+		*priorityCounter++
 	}
 }
 
@@ -302,10 +346,8 @@ var (
 	PortalCreationDummyEvent = event.Type{Type: "fi.mau.dummy.portal_created", Class: event.MessageEventType}
 	PreBackfillDummyEvent    = event.Type{Type: "fi.mau.dummy.pre_backfill", Class: event.MessageEventType}
 
-	// Marker events for when a backfill finishes
 	BackfillEndDummyEvent = event.Type{Type: "fi.mau.dummy.backfill_end", Class: event.MessageEventType}
-	RoomMarker            = event.Type{Type: "m.room.marker", Class: event.MessageEventType}
-	MSC2716Marker         = event.Type{Type: "org.matrix.msc2716.marker", Class: event.MessageEventType}
+	HistorySyncMarker     = event.Type{Type: "org.matrix.msc2716.marker", Class: event.MessageEventType}
 )
 
 func (portal *Portal) backfill(source *User, messages []*waProto.WebMessageInfo) []id.EventID {
@@ -430,15 +472,15 @@ func (portal *Portal) backfill(source *User, messages []*waProto.WebMessageInfo)
 		}
 	}
 
-	insertionEventIds := []id.EventID{}
+	var insertionEventIds []id.EventID
 
 	if len(historyBatch.Events) > 0 && len(historyBatch.PrevEventID) > 0 {
 		portal.log.Infofln("Sending %d historical messages...", len(historyBatch.Events))
 		historyResp, err := portal.MainIntent().BatchSend(portal.MXID, &historyBatch)
-		insertionEventIds = append(insertionEventIds, historyResp.BaseInsertionEventID)
 		if err != nil {
 			portal.log.Errorln("Error sending batch of historical messages:", err)
 		} else {
+			insertionEventIds = append(insertionEventIds, historyResp.BaseInsertionEventID)
 			portal.finishBatch(historyResp.EventIDs, historyBatchInfos)
 			portal.NextBatchID = historyResp.NextBatchID
 			portal.Update()
@@ -448,10 +490,10 @@ func (portal *Portal) backfill(source *User, messages []*waProto.WebMessageInfo)
 	if len(newBatch.Events) > 0 && len(newBatch.PrevEventID) > 0 {
 		portal.log.Infofln("Sending %d new messages...", len(newBatch.Events))
 		newResp, err := portal.MainIntent().BatchSend(portal.MXID, &newBatch)
-		insertionEventIds = append(insertionEventIds, newResp.BaseInsertionEventID)
 		if err != nil {
 			portal.log.Errorln("Error sending batch of new messages:", err)
 		} else {
+			insertionEventIds = append(insertionEventIds, newResp.BaseInsertionEventID)
 			portal.finishBatch(newResp.EventIDs, newBatchInfos)
 		}
 	}
@@ -535,7 +577,7 @@ func (portal *Portal) wrapBatchEvent(info *types.MessageInfo, intent *appservice
 		return nil, err
 	}
 
-	if eventType == event.EventEncrypted {
+	if newEventType == event.EventEncrypted {
 		// Clear other custom keys if the event was encrypted, but keep the double puppet identifier
 		wrappedContent.Raw = map[string]interface{}{backfillIDField: info.ID}
 		if intent.IsCustomPuppet {
@@ -596,24 +638,24 @@ func (portal *Portal) finishBatchEvt(info *wrappedInfo, eventID id.EventID) {
 }
 
 func (portal *Portal) sendPostBackfillDummy(lastTimestamp time.Time, insertionEventId id.EventID) {
-	for _, evtType := range []event.Type{BackfillEndDummyEvent, RoomMarker, MSC2716Marker} {
-		resp, err := portal.MainIntent().SendMessageEvent(portal.MXID, evtType, map[string]interface{}{
-			"org.matrix.msc2716.marker.insertion": insertionEventId,
-			"m.marker.insertion":                  insertionEventId,
-		})
-		if err != nil {
-			portal.log.Errorln("Error sending post-backfill dummy event:", err)
-			return
-		}
-		msg := portal.bridge.DB.Message.New()
-		msg.Chat = portal.Key
-		msg.MXID = resp.EventID
-		msg.JID = types.MessageID(resp.EventID)
-		msg.Timestamp = lastTimestamp.Add(1 * time.Second)
-		msg.Sent = true
-		msg.Insert()
+	// TODO remove after clients stop using this
+	_, _ = portal.MainIntent().SendMessageEvent(portal.MXID, BackfillEndDummyEvent, struct{}{})
 
+	resp, err := portal.MainIntent().SendMessageEvent(portal.MXID, HistorySyncMarker, map[string]interface{}{
+		"org.matrix.msc2716.marker.insertion": insertionEventId,
+		//"m.marker.insertion":                  insertionEventId,
+	})
+	if err != nil {
+		portal.log.Errorln("Error sending post-backfill dummy event:", err)
+		return
 	}
+	msg := portal.bridge.DB.Message.New()
+	msg.Chat = portal.Key
+	msg.MXID = resp.EventID
+	msg.JID = types.MessageID(resp.EventID)
+	msg.Timestamp = lastTimestamp.Add(1 * time.Second)
+	msg.Sent = true
+	msg.Insert()
 }
 
 // endregion

@@ -20,7 +20,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -174,7 +173,12 @@ func (hsc *HistorySyncConversation) Scan(row Scannable) *HistorySyncConversation
 }
 
 func (hsq *HistorySyncQuery) GetNMostRecentConversations(userID id.UserID, n int) (conversations []*HistorySyncConversation) {
-	rows, err := hsq.db.Query(getNMostRecentConversations, userID, n)
+	nPtr := &n
+	// Negative limit on SQLite means unlimited, but Postgres prefers a NULL limit.
+	if n < 0 && hsq.db.dialect == "postgres" {
+		nPtr = nil
+	}
+	rows, err := hsq.db.Query(getNMostRecentConversations, userID, nPtr)
 	defer rows.Close()
 	if err != nil || rows == nil {
 		return nil
@@ -204,17 +208,15 @@ func (hsq *HistorySyncQuery) DeleteAllConversations(userID id.UserID) error {
 
 const (
 	getMessagesBetween = `
-		SELECT data
-		  FROM history_sync_message
-		 WHERE user_mxid=$1
-		   AND conversation_id=$2
-		 %s
-		 ORDER BY timestamp DESC
-		 %s
+		SELECT data FROM history_sync_message
+		WHERE user_mxid=$1 AND conversation_id=$2
+			%s
+		ORDER BY timestamp DESC
+		%s
 	`
-	deleteMessages = `
+	deleteMessagesBetweenExclusive = `
 		DELETE FROM history_sync_message
-		 WHERE %s
+		WHERE user_mxid=$1 AND conversation_id=$2 AND timestamp<$3 AND timestamp>$4
 	`
 )
 
@@ -283,15 +285,15 @@ func (hsq *HistorySyncQuery) GetMessagesBetween(userID id.UserID, conversationID
 
 	var msgData []byte
 	for rows.Next() {
-		err := rows.Scan(&msgData)
+		err = rows.Scan(&msgData)
 		if err != nil {
-			hsq.log.Error("Database scan failed: %v", err)
+			hsq.log.Errorfln("Database scan failed: %v", err)
 			continue
 		}
 		var historySyncMsg waProto.HistorySyncMsg
 		err = proto.Unmarshal(msgData, &historySyncMsg)
 		if err != nil {
-			hsq.log.Errorf("Failed to unmarshal history sync message: %v", err)
+			hsq.log.Errorfln("Failed to unmarshal history sync message: %v", err)
 			continue
 		}
 		messages = append(messages, historySyncMsg.Message)
@@ -300,14 +302,11 @@ func (hsq *HistorySyncQuery) GetMessagesBetween(userID id.UserID, conversationID
 }
 
 func (hsq *HistorySyncQuery) DeleteMessages(userID id.UserID, conversationID string, messages []*waProto.WebMessageInfo) error {
-	whereClauses := []string{}
-	preparedStatementArgs := []interface{}{userID, conversationID}
-	for i, msg := range messages {
-		whereClauses = append(whereClauses, fmt.Sprintf("(user_mxid=$1 AND conversation_id=$2 AND message_id=$%d)", i+3))
-		preparedStatementArgs = append(preparedStatementArgs, msg.GetKey().GetId())
-	}
-
-	_, err := hsq.db.Exec(fmt.Sprintf(deleteMessages, strings.Join(whereClauses, " OR ")), preparedStatementArgs...)
+	newest := messages[0]
+	beforeTS := time.Unix(int64(newest.GetMessageTimestamp())+1, 0)
+	oldest := messages[len(messages)-1]
+	afterTS := time.Unix(int64(oldest.GetMessageTimestamp())-1, 0)
+	_, err := hsq.db.Exec(deleteMessagesBetweenExclusive, userID, conversationID, beforeTS, afterTS)
 	return err
 }
 

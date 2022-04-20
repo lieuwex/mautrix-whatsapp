@@ -68,6 +68,7 @@ type User struct {
 	prevBridgeStatus *BridgeState
 	lastPresence     types.Presence
 
+	historySyncLoopsStarted bool
 	spaceMembershipChecked  bool
 	lastPhoneOfflineWarning time.Time
 
@@ -188,9 +189,6 @@ func (bridge *Bridge) NewUser(dbUser *database.User) *User {
 	user.RelayWhitelisted = user.bridge.Config.Bridge.Permissions.IsRelayWhitelisted(user.MXID)
 	user.Whitelisted = user.bridge.Config.Bridge.Permissions.IsWhitelisted(user.MXID)
 	user.Admin = user.bridge.Config.Bridge.Permissions.IsAdmin(user.MXID)
-	if user.bridge.Config.Bridge.HistorySync.Backfill {
-		go user.handleHistorySyncsLoop()
-	}
 	return user
 }
 
@@ -568,6 +566,18 @@ func (user *User) HandleEvent(event interface{}) {
 			}()
 		}
 		go user.tryAutomaticDoublePuppeting()
+
+		if user.bridge.Config.Bridge.HistorySync.Backfill && !user.historySyncLoopsStarted {
+			go user.handleHistorySyncsLoop()
+			user.historySyncLoopsStarted = true
+
+			if user.bridge.Config.Bridge.HistorySync.BackfillMedia && user.bridge.Config.Bridge.HistorySync.EnqueueBackfillMediaNextStart {
+				var priorityCounter int
+				for _, portal := range user.bridge.GetAllPortalsForUser(user.MXID) {
+					user.EnqueueMediaBackfills(portal, &priorityCounter)
+				}
+			}
+		}
 	case *events.OfflineSyncPreview:
 		user.log.Infofln("Server says it's going to send %d messages and %d receipts that were missed during downtime", v.Messages, v.Receipts)
 		go user.sendBridgeState(BridgeState{
@@ -855,7 +865,7 @@ func (user *User) UpdateDirectChats(chats map[id.UserID][]id.RoomID) {
 	user.log.Debugln("Updating m.direct list on homeserver")
 	var err error
 	if user.bridge.Config.Homeserver.Asmux {
-		urlPath := intent.BuildBaseURL("_matrix", "client", "unstable", "com.beeper.asmux", "dms")
+		urlPath := intent.BuildClientURL("unstable", "com.beeper.asmux", "dms")
 		_, err = intent.MakeFullRequest(mautrix.FullRequest{
 			Method:      method,
 			URL:         urlPath,
