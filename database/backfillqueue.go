@@ -30,18 +30,18 @@ type BackfillType int
 
 const (
 	BackfillImmediate BackfillType = 0
-	BackfillDeferred               = 1
-	BackfillMedia                  = 2
+	BackfillForward   BackfillType = 100
+	BackfillDeferred  BackfillType = 200
 )
 
 func (bt BackfillType) String() string {
 	switch bt {
 	case BackfillImmediate:
 		return "IMMEDIATE"
+	case BackfillForward:
+		return "FORWARD"
 	case BackfillDeferred:
 		return "DEFERRED"
-	case BackfillMedia:
-		return "MEDIA"
 	}
 	return "UNKNOWN"
 }
@@ -80,16 +80,15 @@ const (
 		SELECT queue_id, user_mxid, type, priority, portal_jid, portal_receiver, time_start, time_end, max_batch_events, max_total_events, batch_delay
 		FROM backfill_queue
 		WHERE user_mxid=$1
-			AND type=$2
 			AND completed_at IS NULL
-		ORDER BY priority, queue_id
+		ORDER BY type, priority, queue_id
 		LIMIT 1
 	`
 )
 
 // GetNext returns the next backfill to perform
-func (bq *BackfillQuery) GetNext(userID id.UserID, backfillType BackfillType) (backfill *Backfill) {
-	rows, err := bq.db.Query(getNextBackfillQuery, userID, backfillType)
+func (bq *BackfillQuery) GetNext(userID id.UserID) (backfill *Backfill) {
+	rows, err := bq.db.Query(getNextBackfillQuery, userID)
 	defer rows.Close()
 	if err != nil || rows == nil {
 		bq.log.Error(err)
@@ -103,6 +102,16 @@ func (bq *BackfillQuery) GetNext(userID id.UserID, backfillType BackfillType) (b
 
 func (bq *BackfillQuery) DeleteAll(userID id.UserID) error {
 	_, err := bq.db.Exec("DELETE FROM backfill_queue WHERE user_mxid=$1", userID)
+	return err
+}
+
+func (bq *BackfillQuery) DeleteAllForPortal(userID id.UserID, portalKey PortalKey) error {
+	_, err := bq.db.Exec(`
+		DELETE FROM backfill_queue
+		WHERE user_mxid=$1
+			AND portal_jid=$2
+			AND portal_receiver=$3
+	`, userID, portalKey.JID, portalKey.Receiver)
 	return err
 }
 

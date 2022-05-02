@@ -76,6 +76,8 @@ type User struct {
 	groupListCacheLock sync.Mutex
 	groupListCacheTime time.Time
 
+	bridgeStateQueue chan BridgeState
+
 	BackfillQueue *BackfillQueue
 }
 
@@ -168,6 +170,7 @@ func (bridge *Bridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
 			user.JID = types.EmptyJID
 			user.Update()
 		} else {
+			user.Session.Log = &waLogger{user.log.Sub("Session")}
 			bridge.usersByUsername[user.JID.User] = user
 		}
 	}
@@ -189,6 +192,10 @@ func (bridge *Bridge) NewUser(dbUser *database.User) *User {
 	user.RelayWhitelisted = user.bridge.Config.Bridge.Permissions.IsRelayWhitelisted(user.MXID)
 	user.Whitelisted = user.bridge.Config.Bridge.Permissions.IsWhitelisted(user.MXID)
 	user.Admin = user.bridge.Config.Bridge.Permissions.IsAdmin(user.MXID)
+	if len(user.bridge.Config.Homeserver.StatusEndpoint) > 0 {
+		user.bridgeStateQueue = make(chan BridgeState, 10)
+		go user.bridgeStateLoop()
+	}
 	return user
 }
 
@@ -327,6 +334,7 @@ var ErrAlreadyLoggedIn = errors.New("already logged in")
 
 func (user *User) createClient(sess *store.Device) {
 	user.Client = whatsmeow.NewClient(sess, &waLogger{user.log.Sub("Client")})
+	user.Client.DebugDecodeBeforeSend = user.bridge.Config.WhatsApp.DebugDecodeBeforeSend
 	user.Client.AddEventHandler(user.HandleEvent)
 	user.Client.SetForceActiveDeliveryReceipts(user.bridge.Config.Bridge.ForceActiveDeliveryReceipts)
 	user.Client.GetMessageForRetry = func(to types.JID, id types.MessageID) *waProto.Message {
@@ -375,6 +383,13 @@ func (user *User) Connect() bool {
 	err := user.Client.Connect()
 	if err != nil {
 		user.log.Warnln("Error connecting to WhatsApp:", err)
+		user.sendBridgeState(BridgeState{
+			StateEvent: StateUnknownError,
+			Error:      WAConnectionFailed,
+			Info: map[string]interface{}{
+				"go_error": err.Error(),
+			},
+		})
 		return false
 	}
 	return true
@@ -570,13 +585,6 @@ func (user *User) HandleEvent(event interface{}) {
 		if user.bridge.Config.Bridge.HistorySync.Backfill && !user.historySyncLoopsStarted {
 			go user.handleHistorySyncsLoop()
 			user.historySyncLoopsStarted = true
-
-			if user.bridge.Config.Bridge.HistorySync.BackfillMedia && user.bridge.Config.Bridge.HistorySync.EnqueueBackfillMediaNextStart {
-				var priorityCounter int
-				for _, portal := range user.bridge.GetAllPortalsForUser(user.MXID) {
-					user.EnqueueMediaBackfills(portal, &priorityCounter)
-				}
-			}
 		}
 	case *events.OfflineSyncPreview:
 		user.log.Infofln("Server says it's going to send %d messages and %d receipts that were missed during downtime", v.Messages, v.Receipts)
@@ -824,9 +832,13 @@ func (user *User) syncChatDoublePuppetDetails(portal *Portal, justCreated bool) 
 			return
 		}
 		intent := doublePuppet.CustomIntent()
-		if portal.Key.JID == types.StatusBroadcastJID && justCreated && user.bridge.Config.Bridge.MuteStatusBroadcast {
-			user.updateChatMute(intent, portal, time.Now().Add(365*24*time.Hour))
-			user.updateChatTag(intent, portal, user.bridge.Config.Bridge.ArchiveTag, true)
+		if portal.Key.JID == types.StatusBroadcastJID && justCreated {
+			if user.bridge.Config.Bridge.MuteStatusBroadcast {
+				user.updateChatMute(intent, portal, time.Now().Add(365*24*time.Hour))
+			}
+			if len(user.bridge.Config.Bridge.StatusBroadcastTag) > 0 {
+				user.updateChatTag(intent, portal, user.bridge.Config.Bridge.StatusBroadcastTag, true)
+			}
 			return
 		} else if !chat.Found {
 			return
@@ -899,8 +911,8 @@ func (user *User) handleLoggedOut(onConnect bool, reason events.ConnectFailureRe
 	errorCode := WAUnknownLogout
 	if reason == events.ConnectFailureLoggedOut {
 		errorCode = WALoggedOut
-	} else if reason == events.ConnectFailureBanned {
-		errorCode = WAAccountBanned
+	} else if reason == events.ConnectFailureMainDeviceGone {
+		errorCode = WAMainDeviceGone
 	}
 	user.removeFromJIDMap(BridgeState{StateEvent: StateBadCredentials, Error: errorCode})
 	user.DeleteConnection()
@@ -1007,7 +1019,7 @@ func (user *User) handleReceipt(receipt *events.Receipt) {
 	if portal == nil || len(portal.MXID) == 0 {
 		return
 	}
-	portal.receipts <- PortalReceipt{evt: receipt, source: user}
+	portal.messages <- PortalMessage{receipt: receipt, source: user}
 }
 
 func makeReadMarkerContent(eventID id.EventID, doublePuppet bool) CustomReadMarkers {

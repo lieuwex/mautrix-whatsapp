@@ -144,7 +144,6 @@ func (bridge *Bridge) newBlankPortal(key database.PortalKey) *Portal {
 		log:    bridge.Log.Sub(fmt.Sprintf("Portal/%s", key)),
 
 		messages:       make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
-		receipts:       make(chan PortalReceipt, bridge.Config.Bridge.PortalMessageBuffer),
 		matrixMessages: make(chan PortalMatrixMessage, bridge.Config.Bridge.PortalMessageBuffer),
 		mediaRetries:   make(chan PortalMediaRetry, bridge.Config.Bridge.PortalMessageBuffer),
 
@@ -180,13 +179,9 @@ type fakeMessage struct {
 type PortalMessage struct {
 	evt           *events.Message
 	undecryptable *events.UndecryptableMessage
+	receipt       *events.Receipt
 	fake          *fakeMessage
 	source        *User
-}
-
-type PortalReceipt struct {
-	evt    *events.Receipt
-	source *User
 }
 
 type PortalMatrixMessage struct {
@@ -225,7 +220,6 @@ type Portal struct {
 	currentlyTypingLock sync.Mutex
 
 	messages       chan PortalMessage
-	receipts       chan PortalReceipt
 	matrixMessages chan PortalMatrixMessage
 	mediaRetries   chan PortalMediaRetry
 
@@ -249,6 +243,8 @@ func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
 	}
 	if msg.evt != nil {
 		portal.handleMessage(msg.source, msg.evt)
+	} else if msg.receipt != nil {
+		portal.handleReceipt(msg.receipt, msg.source)
 	} else if msg.undecryptable != nil {
 		portal.handleUndecryptableMessage(msg.source, msg.undecryptable)
 	} else if msg.fake != nil {
@@ -313,8 +309,6 @@ func (portal *Portal) handleMessageLoop() {
 		select {
 		case msg := <-portal.messages:
 			portal.handleMessageLoopItem(msg)
-		case receipt := <-portal.receipts:
-			portal.handleReceipt(receipt.evt, receipt.source)
 		case msg := <-portal.matrixMessages:
 			portal.handleMatrixMessageLoopItem(msg)
 		case retry := <-portal.mediaRetries:
@@ -458,20 +452,24 @@ func formatDuration(d time.Duration) string {
 	return naturalJoin(parts)
 }
 
-func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, waMsg *waProto.Message) *ConvertedMessage {
+func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, waMsg *waProto.Message, isBackfill bool) *ConvertedMessage {
 	switch {
 	case waMsg.Conversation != nil || waMsg.ExtendedTextMessage != nil:
 		return portal.convertTextMessage(intent, source, waMsg)
 	case waMsg.ImageMessage != nil:
-		return portal.convertMediaMessage(intent, source, info, waMsg.GetImageMessage())
+		return portal.convertMediaMessage(intent, source, info, waMsg.GetImageMessage(), "photo", isBackfill)
 	case waMsg.StickerMessage != nil:
-		return portal.convertMediaMessage(intent, source, info, waMsg.GetStickerMessage())
+		return portal.convertMediaMessage(intent, source, info, waMsg.GetStickerMessage(), "sticker", isBackfill)
 	case waMsg.VideoMessage != nil:
-		return portal.convertMediaMessage(intent, source, info, waMsg.GetVideoMessage())
+		return portal.convertMediaMessage(intent, source, info, waMsg.GetVideoMessage(), "video attachment", isBackfill)
 	case waMsg.AudioMessage != nil:
-		return portal.convertMediaMessage(intent, source, info, waMsg.GetAudioMessage())
+		typeName := "audio attachment"
+		if waMsg.GetAudioMessage().GetPtt() {
+			typeName = "voice message"
+		}
+		return portal.convertMediaMessage(intent, source, info, waMsg.GetAudioMessage(), typeName, isBackfill)
 	case waMsg.DocumentMessage != nil:
-		return portal.convertMediaMessage(intent, source, info, waMsg.GetDocumentMessage())
+		return portal.convertMediaMessage(intent, source, info, waMsg.GetDocumentMessage(), "file attachment", isBackfill)
 	case waMsg.ContactMessage != nil:
 		return portal.convertContactMessage(intent, waMsg.GetContactMessage())
 	case waMsg.ContactsArrayMessage != nil:
@@ -625,7 +623,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		portal.log.Debugfln("Not handling %s (%s): user doesn't have double puppeting enabled", msgID, msgType)
 		return
 	}
-	converted := portal.convertMessage(intent, source, &evt.Info, evt.Message)
+	converted := portal.convertMessage(intent, source, &evt.Info, evt.Message, false)
 	if converted != nil {
 		if evt.Info.IsIncomingBroadcast() {
 			if converted.Extra == nil {
@@ -1221,7 +1219,15 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	} else {
 		if groupInfo == nil || !isFullInfo {
 			foundInfo, err := user.Client.GetGroupInfo(portal.Key.JID)
-			if err != nil {
+
+			// Ensure that the user is actually a participant in the conversation
+			// before creating the matrix room
+			if errors.Is(err, whatsmeow.ErrNotInGroup) {
+				user.log.Debugfln("Skipping creating matrix room for %s because the user is not a participant", portal.Key.JID)
+				user.bridge.DB.BackfillQuery.DeleteAllForPortal(user.MXID, portal.Key)
+				user.bridge.DB.HistorySyncQuery.DeleteAllMessagesForPortal(user.MXID, portal.Key)
+				return err
+			} else if err != nil {
 				portal.log.Warnfln("Failed to get group info through %s: %v", user.JID, err)
 			} else {
 				groupInfo = foundInfo
@@ -1310,6 +1316,10 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	go portal.addToSpace(user)
 
 	if groupInfo != nil {
+		if groupInfo.IsEphemeral {
+			portal.ExpirationTime = groupInfo.DisappearingTimer
+			portal.Update()
+		}
 		portal.SyncParticipants(user, groupInfo)
 		if groupInfo.IsAnnounce {
 			portal.RestrictMessageSending(groupInfo.IsAnnounce)
@@ -1343,10 +1353,9 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	}
 
 	if user.bridge.Config.Bridge.HistorySync.Backfill && backfill {
-		var priorityCounter int
-		user.EnqueueImmedateBackfill(portal, &priorityCounter)
-		user.EnqueueDeferredBackfills(portal, &priorityCounter)
-		user.EnqueueMediaBackfills(portal, &priorityCounter)
+		portals := []*Portal{portal}
+		user.EnqueueImmedateBackfills(portals)
+		user.EnqueueDeferredBackfills(portals)
 		user.BackfillQueue.ReCheckQueue <- true
 	}
 	return nil
@@ -1584,6 +1593,7 @@ type ConvertedMessage struct {
 	ReplyTo   types.MessageID
 	ExpiresIn uint32
 	Error     database.MessageErrorType
+	MediaKey  []byte
 }
 
 func (portal *Portal) convertTextMessage(intent *appservice.IntentAPI, source *User, msg *waProto.Message) *ConvertedMessage {
@@ -1727,7 +1737,7 @@ func (portal *Portal) convertContactMessage(intent *appservice.IntentAPI, msg *w
 	fileName := fmt.Sprintf("%s.vcf", msg.GetDisplayName())
 	data := []byte(msg.GetVcard())
 	mimeType := "text/vcard"
-	data, uploadMimeType, file := portal.encryptFile(data, mimeType)
+	uploadMimeType, file := portal.encryptFileInPlace(data, mimeType)
 
 	uploadResp, err := intent.UploadBytesWithName(data, uploadMimeType, fileName)
 	if err != nil {
@@ -1933,16 +1943,17 @@ func (portal *Portal) makeMediaBridgeFailureMessage(info *types.MessageInfo, bri
 	return converted
 }
 
-func (portal *Portal) encryptFile(data []byte, mimeType string) ([]byte, string, *event.EncryptedFileInfo) {
+func (portal *Portal) encryptFileInPlace(data []byte, mimeType string) (string, *event.EncryptedFileInfo) {
 	if !portal.Encrypted {
-		return data, mimeType, nil
+		return mimeType, nil
 	}
 
 	file := &event.EncryptedFileInfo{
 		EncryptedFile: *attachment.NewEncryptedFile(),
 		URL:           "",
 	}
-	return file.Encrypt(data), "application/octet-stream", file
+	file.EncryptInPlace(data)
+	return "application/octet-stream", file
 }
 
 type MediaMessage interface {
@@ -2031,8 +2042,8 @@ func (portal *Portal) convertMediaMessageContent(intent *appservice.IntentAPI, m
 		thumbnailMime := http.DetectContentType(thumbnailData)
 		thumbnailCfg, _, _ := image.DecodeConfig(bytes.NewReader(thumbnailData))
 		thumbnailSize := len(thumbnailData)
-		thumbnail, thumbnailUploadMime, thumbnailFile := portal.encryptFile(thumbnailData, thumbnailMime)
-		uploadedThumbnail, err := intent.UploadBytes(thumbnail, thumbnailUploadMime)
+		thumbnailUploadMime, thumbnailFile := portal.encryptFileInPlace(thumbnailData, thumbnailMime)
+		uploadedThumbnail, err := intent.UploadBytes(thumbnailData, thumbnailUploadMime)
 		if err != nil {
 			portal.log.Warnfln("Failed to upload thumbnail: %v", err)
 		} else if uploadedThumbnail != nil {
@@ -2125,7 +2136,7 @@ func (portal *Portal) convertMediaMessageContent(intent *appservice.IntentAPI, m
 }
 
 func (portal *Portal) uploadMedia(intent *appservice.IntentAPI, data []byte, content *event.MessageEventContent) error {
-	data, uploadMimeType, file := portal.encryptFile(data, content.Info.MimeType)
+	uploadMimeType, file := portal.encryptFileInPlace(data, content.Info.MimeType)
 
 	req := mautrix.ReqUploadMedia{
 		ContentBytes: data,
@@ -2161,23 +2172,27 @@ func (portal *Portal) uploadMedia(intent *appservice.IntentAPI, data []byte, con
 	return nil
 }
 
-func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, msg MediaMessage) *ConvertedMessage {
+func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, msg MediaMessage, typeName string, isBackfill bool) *ConvertedMessage {
 	converted := portal.convertMediaMessageContent(intent, msg)
 	data, err := source.Client.Download(msg)
 	if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) {
-		//portal.log.Warnfln("Failed to download media for %s: %v. Requesting retry", info.ID, err)
-		//err = source.Client.SendMediaRetryReceipt(info, msg.GetMediaKey())
-		//if err != nil {
-		//	portal.log.Errorfln("Failed to send media retry receipt for %s: %v", info.ID, err)
-		//}
 		converted.Error = database.MsgErrMediaNotFound
+		converted.MediaKey = msg.GetMediaKey()
+
+		errorText := fmt.Sprintf("Old %s.", typeName)
+		if portal.bridge.Config.Bridge.HistorySync.AutoRequestMedia && isBackfill {
+			errorText += " Media will be automatically requested from your phone later."
+		} else {
+			errorText += ` React with the \u267b (recycle) emoji to request this media from your phone.`
+		}
+
 		return portal.makeMediaBridgeFailureMessage(info, err, converted, &FailedMediaKeys{
 			Key:       msg.GetMediaKey(),
 			Length:    int(msg.GetFileLength()),
 			Type:      whatsmeow.GetMediaType(msg),
 			SHA256:    msg.GetFileSha256(),
 			EncSHA256: msg.GetFileEncSha256(),
-		}, "Old photo or attachment. This will sync in a future update.")
+		}, errorText)
 	} else if errors.Is(err, whatsmeow.ErrNoURLPresent) {
 		portal.log.Debugfln("No URL present error for media message %s, ignoring...", info.ID)
 		return nil
@@ -2236,6 +2251,26 @@ func (portal *Portal) fetchMediaRetryEvent(msg *database.Message) (*FailedMediaM
 	return errorMeta, nil
 }
 
+func (portal *Portal) sendMediaRetryFailureEdit(intent *appservice.IntentAPI, msg *database.Message, err error) {
+	content := event.MessageEventContent{
+		MsgType: event.MsgNotice,
+		Body:    fmt.Sprintf("Failed to bridge media after re-requesting it from your phone: %v", err),
+	}
+	contentCopy := content
+	content.NewContent = &contentCopy
+	content.RelatesTo = &event.RelatesTo{
+		EventID: msg.MXID,
+		Type:    event.RelReplace,
+	}
+	resp, sendErr := portal.sendMessage(intent, event.EventMessage, &content, nil, time.Now().UnixMilli())
+	if sendErr != nil {
+		portal.log.Warnfln("Failed to edit %s after retry failure for %s: %v", msg.MXID, msg.JID, sendErr)
+	} else {
+		portal.log.Debugfln("Successfully edited %s -> %s after retry failure for %s", msg.MXID, resp.EventID, msg.JID)
+	}
+
+}
+
 func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 	msg := portal.bridge.DB.Message.GetByJID(portal.Key, retry.MessageID)
 	if msg == nil {
@@ -2252,15 +2287,6 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 		return
 	}
 
-	retryData, err := whatsmeow.DecryptMediaRetryNotification(retry, meta.Media.Key)
-	if err != nil {
-		portal.log.Warnfln("Failed to handle media retry notification for %s: %v", retry.MessageID, err)
-		return
-	} else if retryData.GetResult() != waProto.MediaRetryNotification_SUCCESS {
-		portal.log.Warnfln("Got error response in media retry notification for %s: %s", retry.MessageID, waProto.MediaRetryNotification_MediaRetryNotificationResultType_name[int32(retryData.GetResult())])
-		return
-	}
-
 	var puppet *Puppet
 	if retry.FromMe {
 		puppet = portal.bridge.GetPuppetByJID(source.JID)
@@ -2271,14 +2297,33 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 	}
 	intent := puppet.IntentFor(portal)
 
+	retryData, err := whatsmeow.DecryptMediaRetryNotification(retry, meta.Media.Key)
+	if err != nil {
+		portal.log.Warnfln("Failed to handle media retry notification for %s: %v", retry.MessageID, err)
+		portal.sendMediaRetryFailureEdit(intent, msg, err)
+		return
+	} else if retryData.GetResult() != waProto.MediaRetryNotification_SUCCESS {
+		errorName := waProto.MediaRetryNotification_MediaRetryNotificationResultType_name[int32(retryData.GetResult())]
+		portal.log.Warnfln("Got error response in media retry notification for %s: %s", retry.MessageID, errorName)
+		portal.log.Debugfln("Error response contents: %s / %s", retryData.GetStanzaId(), retryData.GetDirectPath())
+		if retryData.GetResult() == waProto.MediaRetryNotification_NOT_FOUND {
+			portal.sendMediaRetryFailureEdit(intent, msg, whatsmeow.ErrMediaNotAvailableOnPhone)
+		} else {
+			portal.sendMediaRetryFailureEdit(intent, msg, fmt.Errorf("phone sent error response: %s", errorName))
+		}
+		return
+	}
+
 	data, err := source.Client.DownloadMediaWithPath(retryData.GetDirectPath(), meta.Media.EncSHA256, meta.Media.SHA256, meta.Media.Key, meta.Media.Length, meta.Media.Type, "")
 	if err != nil {
 		portal.log.Warnfln("Failed to download media in %s after retry notification: %v", retry.MessageID, err)
+		portal.sendMediaRetryFailureEdit(intent, msg, err)
 		return
 	}
 	err = portal.uploadMedia(intent, data, meta.Content)
 	if err != nil {
 		portal.log.Warnfln("Failed to re-upload media for %s after retry notification: %v", retry.MessageID, err)
+		portal.sendMediaRetryFailureEdit(intent, msg, fmt.Errorf("re-uploading media failed: %v", err))
 		return
 	}
 	replaceContent := &event.MessageEventContent{
@@ -2303,20 +2348,20 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 	msg.UpdateMXID(resp.EventID, database.MsgNormal, database.MsgNoError)
 }
 
-func (portal *Portal) requestMediaRetry(user *User, eventID id.EventID) {
+func (portal *Portal) requestMediaRetry(user *User, eventID id.EventID) bool {
 	msg := portal.bridge.DB.Message.GetByMXID(eventID)
 	if msg == nil {
 		portal.log.Debugfln("%s requested a media retry for unknown event %s", user.MXID, eventID)
-		return
+		return false
 	} else if msg.Error != database.MsgErrMediaNotFound {
 		portal.log.Debugfln("%s requested a media retry for non-errored event %s", user.MXID, eventID)
-		return
+		return false
 	}
 
 	evt, err := portal.fetchMediaRetryEvent(msg)
 	if err != nil {
 		portal.log.Warnfln("Can't send media retry request for %s: %v", msg.JID, err)
-		return
+		return true
 	}
 
 	err = user.Client.SendMediaRetryReceipt(&types.MessageInfo{
@@ -2333,6 +2378,7 @@ func (portal *Portal) requestMediaRetry(user *User, eventID id.EventID) {
 	} else {
 		portal.log.Debugfln("Sent media retry request for %s", msg.JID)
 	}
+	return true
 }
 
 const thumbnailMaxSize = 72
@@ -2435,7 +2481,7 @@ func (portal *Portal) preprocessMatrixMedia(sender *User, relaybotFormatted bool
 		return nil
 	}
 	if file != nil {
-		data, err = file.Decrypt(data)
+		err = file.DecryptInPlace(data)
 		if err != nil {
 			portal.log.Errorfln("Failed to decrypt media in %s: %v", eventID, err)
 			return nil

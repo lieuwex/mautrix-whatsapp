@@ -47,13 +47,11 @@ type BridgeConfig struct {
 
 	HistorySync struct {
 		CreatePortals bool `yaml:"create_portals"`
-
-		Backfill                      bool `yaml:"backfill"`
-		BackfillMedia                 bool `yaml:"backfill_media"`
-		EnqueueBackfillMediaNextStart bool `yaml:"enqueue_backfill_media_next_start"`
+		Backfill      bool `yaml:"backfill"`
 
 		DoublePuppetBackfill    bool `yaml:"double_puppet_backfill"`
 		RequestFullSync         bool `yaml:"request_full_sync"`
+		AutoRequestMedia        bool `yaml:"auto_request_media"`
 		MaxInitialConversations int  `yaml:"max_initial_conversations"`
 
 		Immediate struct {
@@ -62,7 +60,6 @@ type BridgeConfig struct {
 		} `yaml:"immediate"`
 
 		Deferred []DeferredConfig `yaml:"deferred"`
-		Media    []DeferredConfig `yaml:"media"`
 	} `yaml:"history_sync"`
 	UserAvatarSync    bool `yaml:"user_avatar_sync"`
 	BridgeMatrixLeave bool `yaml:"bridge_matrix_leave"`
@@ -89,6 +86,7 @@ type BridgeConfig struct {
 	MarkReadOnlyOnCreate  bool   `yaml:"mark_read_only_on_create"`
 	EnableStatusBroadcast bool   `yaml:"enable_status_broadcast"`
 	MuteStatusBroadcast   bool   `yaml:"mute_status_broadcast"`
+	StatusBroadcastTag    string `yaml:"status_broadcast_tag"`
 	WhatsappThumbnail     bool   `yaml:"whatsapp_thumbnail"`
 	AllowUserInvite       bool   `yaml:"allow_user_invite"`
 	FederateRooms         bool   `yaml:"federate_rooms"`

@@ -23,9 +23,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime/debug"
 	"time"
-
-	log "maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix/id"
 )
@@ -47,23 +46,25 @@ const (
 type BridgeErrorCode string
 
 const (
-	WALoggedOut     BridgeErrorCode = "wa-logged-out"
-	WAAccountBanned BridgeErrorCode = "wa-account-banned"
-	WAUnknownLogout BridgeErrorCode = "wa-unknown-logout"
-	WANotConnected  BridgeErrorCode = "wa-not-connected"
-	WAConnecting    BridgeErrorCode = "wa-connecting"
-	WAServerTimeout BridgeErrorCode = "wa-server-timeout"
-	WAPhoneOffline  BridgeErrorCode = "wa-phone-offline"
+	WALoggedOut        BridgeErrorCode = "wa-logged-out"
+	WAMainDeviceGone   BridgeErrorCode = "wa-main-device-gone"
+	WAUnknownLogout    BridgeErrorCode = "wa-unknown-logout"
+	WANotConnected     BridgeErrorCode = "wa-not-connected"
+	WAConnecting       BridgeErrorCode = "wa-connecting"
+	WAServerTimeout    BridgeErrorCode = "wa-server-timeout"
+	WAPhoneOffline     BridgeErrorCode = "wa-phone-offline"
+	WAConnectionFailed BridgeErrorCode = "wa-connection-failed"
 )
 
 var bridgeHumanErrors = map[BridgeErrorCode]string{
-	WALoggedOut:     "You were logged out from another device. Relogin to continue using the bridge.",
-	WAAccountBanned: "Your account was banned from WhatsApp. You can contact support from the WhatsApp mobile app on your phone.",
-	WAUnknownLogout: "You were logged out for an unknown reason. Relogin to continue using the bridge.",
-	WANotConnected:  "You're not connected to WhatsApp",
-	WAConnecting:    "Reconnecting to WhatsApp...",
-	WAServerTimeout: "The WhatsApp web servers are not responding. The bridge will try to reconnect.",
-	WAPhoneOffline:  "Your phone hasn't been seen in over 12 days. The bridge is currently connected, but will get disconnected if you don't open the app soon.",
+	WALoggedOut:        "You were logged out from another device. Relogin to continue using the bridge.",
+	WAMainDeviceGone:   "Your phone was logged out from WhatsApp. Relogin to continue using the bridge.",
+	WAUnknownLogout:    "You were logged out for an unknown reason. Relogin to continue using the bridge.",
+	WANotConnected:     "You're not connected to WhatsApp",
+	WAConnecting:       "Reconnecting to WhatsApp...",
+	WAServerTimeout:    "The WhatsApp web servers are not responding. The bridge will try to reconnect.",
+	WAPhoneOffline:     "Your phone hasn't been seen in over 12 days. The bridge is currently connected, but will get disconnected if you don't open the app soon.",
+	WAConnectionFailed: "Connecting to the WhatsApp web servers failed.",
 }
 
 type BridgeState struct {
@@ -78,6 +79,9 @@ type BridgeState struct {
 	UserID     id.UserID `json:"user_id,omitempty"`
 	RemoteID   string    `json:"remote_id,omitempty"`
 	RemoteName string    `json:"remote_name,omitempty"`
+
+	Reason string                 `json:"reason,omitempty"`
+	Info   map[string]interface{} `json:"info,omitempty"`
 }
 
 type GlobalBridgeState struct {
@@ -110,27 +114,23 @@ func (pong *BridgeState) shouldDeduplicate(newPong *BridgeState) bool {
 	return pong.Timestamp+int64(pong.TTL/5) > time.Now().Unix()
 }
 
-func (bridge *Bridge) createBridgeStateRequest(ctx context.Context, state *BridgeState) (req *http.Request, err error) {
+func (bridge *Bridge) sendBridgeState(ctx context.Context, state *BridgeState) error {
 	var body bytes.Buffer
-	if err = json.NewEncoder(&body).Encode(&state); err != nil {
-		return nil, fmt.Errorf("failed to encode bridge state JSON: %w", err)
+	if err := json.NewEncoder(&body).Encode(&state); err != nil {
+		return fmt.Errorf("failed to encode bridge state JSON: %w", err)
 	}
 
-	req, err = http.NewRequestWithContext(ctx, http.MethodPost, bridge.Config.Homeserver.StatusEndpoint, &body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, bridge.Config.Homeserver.StatusEndpoint, &body)
 	if err != nil {
-		return
+		return fmt.Errorf("failed to prepare request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+bridge.Config.AppService.ASToken)
 	req.Header.Set("Content-Type", "application/json")
-	return
-}
 
-func sendPreparedBridgeStateRequest(logger log.Logger, req *http.Request) bool {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		logger.Warnln("Failed to send bridge state update:", err)
-		return false
+		return fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -138,10 +138,9 @@ func sendPreparedBridgeStateRequest(logger log.Logger, req *http.Request) bool {
 		if respBody != nil {
 			respBody = bytes.ReplaceAll(respBody, []byte("\n"), []byte("\\n"))
 		}
-		logger.Warnfln("Unexpected status code %d sending bridge state update: %s", resp.StatusCode, respBody)
-		return false
+		return fmt.Errorf("unexpected status code %d sending bridge state update: %s", resp.StatusCode, respBody)
 	}
-	return true
+	return nil
 }
 
 func (bridge *Bridge) sendGlobalBridgeState(state BridgeState) {
@@ -151,10 +150,48 @@ func (bridge *Bridge) sendGlobalBridgeState(state BridgeState) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if req, err := bridge.createBridgeStateRequest(ctx, &state); err != nil {
-		bridge.Log.Warnln("Failed to prepare global bridge state update request:", err)
-	} else if ok := sendPreparedBridgeStateRequest(bridge.Log, req); ok {
+	if err := bridge.sendBridgeState(ctx, &state); err != nil {
+		bridge.Log.Warnln("Failed to update global bridge state:", err)
+	} else {
 		bridge.Log.Debugfln("Sent new global bridge state %+v", state)
+	}
+}
+
+func (user *User) bridgeStateLoop() {
+	defer func() {
+		err := recover()
+		if err != nil {
+			user.log.Errorfln("Bridge state loop panicked: %v\n%s", err, debug.Stack())
+		}
+	}()
+	for state := range user.bridgeStateQueue {
+		user.immediateSendBridgeState(state)
+	}
+}
+
+func (user *User) immediateSendBridgeState(state BridgeState) {
+	retryIn := 2
+	for {
+		if user.prevBridgeStatus != nil && user.prevBridgeStatus.shouldDeduplicate(&state) {
+			user.log.Debugfln("Not sending bridge state %s as it's a duplicate", state.StateEvent)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := user.bridge.sendBridgeState(ctx, &state)
+		cancel()
+
+		if err != nil {
+			user.log.Warnfln("Failed to update bridge state: %v, retrying in %d seconds", err, retryIn)
+			time.Sleep(time.Duration(retryIn) * time.Second)
+			retryIn *= 2
+			if retryIn > 64 {
+				retryIn = 64
+			}
+		} else {
+			user.log.Debugfln("Sent new bridge state %+v", state)
+			return
+		}
 	}
 }
 
@@ -164,17 +201,18 @@ func (user *User) sendBridgeState(state BridgeState) {
 	}
 
 	state = state.fill(user)
-	if user.prevBridgeStatus != nil && user.prevBridgeStatus.shouldDeduplicate(&state) {
-		return
-	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if req, err := user.bridge.createBridgeStateRequest(ctx, &state); err != nil {
-		user.log.Warnln("Failed to prepare bridge state update request:", err)
-	} else if ok := sendPreparedBridgeStateRequest(user.log, req); ok {
-		user.prevBridgeStatus = &state
-		user.log.Debugfln("Sent new bridge state %+v", state)
+	if len(user.bridgeStateQueue) >= 8 {
+		user.log.Warnln("Bridge state queue is nearly full, discarding an item")
+		select {
+		case <-user.bridgeStateQueue:
+		default:
+		}
+	}
+	select {
+	case user.bridgeStateQueue <- state:
+	default:
+		user.log.Errorfln("Bridge state queue is full, dropped new state")
 	}
 }
 
