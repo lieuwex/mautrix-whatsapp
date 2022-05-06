@@ -335,6 +335,7 @@ var ErrAlreadyLoggedIn = errors.New("already logged in")
 func (user *User) createClient(sess *store.Device) {
 	user.Client = whatsmeow.NewClient(sess, &waLogger{user.log.Sub("Client")})
 	user.Client.DebugDecodeBeforeSend = user.bridge.Config.WhatsApp.DebugDecodeBeforeSend
+	user.Client.OneMessageAtATime = user.bridge.Config.WhatsApp.DebugDecodeBeforeSend
 	user.Client.AddEventHandler(user.HandleEvent)
 	user.Client.SetForceActiveDeliveryReceipts(user.bridge.Config.Bridge.ForceActiveDeliveryReceipts)
 	user.Client.GetMessageForRetry = func(to types.JID, id types.MessageID) *waProto.Message {
@@ -535,9 +536,13 @@ func (user *User) phoneSeen(ts time.Time) {
 		// The last seen timestamp isn't going to be perfectly accurate in any case,
 		// so don't spam the database with an update every time there's an event.
 		return
-	} else if !user.PhoneRecentlySeen(false) && user.GetPrevBridgeState().Error == WAPhoneOffline && user.IsConnected() {
-		user.log.Debugfln("Saw phone after current bridge state said it has been offline, switching state back to connected")
-		go user.sendBridgeState(BridgeState{StateEvent: StateConnected})
+	} else if !user.PhoneRecentlySeen(false) {
+		if user.GetPrevBridgeState().Error == WAPhoneOffline && user.IsConnected() {
+			user.log.Debugfln("Saw phone after current bridge state said it has been offline, switching state back to connected")
+			go user.sendBridgeState(BridgeState{StateEvent: StateConnected})
+		} else {
+			user.log.Debugfln("Saw phone after current bridge state said it has been offline, not sending new bridge state (prev: %s, connected: %t)", user.GetPrevBridgeState().Error, user.IsConnected())
+		}
 	}
 	user.PhoneLastSeen = ts
 	go user.Update()
