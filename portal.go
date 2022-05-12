@@ -804,6 +804,7 @@ func (portal *Portal) SyncParticipants(source *User, metadata *types.GroupInfo) 
 		levels = portal.GetBasePowerLevels()
 		changed = true
 	}
+	changed = portal.applyPowerLevelFixes(levels) || changed
 	participantMap := make(map[types.JID]bool)
 	for _, participant := range metadata.Participants {
 		participantMap[participant.JID] = true
@@ -1045,8 +1046,17 @@ func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
 			event.StateRoomName.Type:   anyone,
 			event.StateRoomAvatar.Type: anyone,
 			event.StateTopic.Type:      anyone,
+			event.EventReaction.Type:   anyone,
+			event.EventRedaction.Type:  anyone,
 		},
 	}
+}
+
+func (portal *Portal) applyPowerLevelFixes(levels *event.PowerLevelsEventContent) bool {
+	changed := false
+	changed = levels.EnsureEventLevel(event.EventReaction, 0) || changed
+	changed = levels.EnsureEventLevel(event.EventRedaction, 0) || changed
+	return changed
 }
 
 func (portal *Portal) ChangeAdminStatus(jids []types.JID, setAdmin bool) id.EventID {
@@ -1058,7 +1068,7 @@ func (portal *Portal) ChangeAdminStatus(jids []types.JID, setAdmin bool) id.Even
 	if setAdmin {
 		newLevel = 50
 	}
-	changed := false
+	changed := portal.applyPowerLevelFixes(levels)
 	for _, jid := range jids {
 		puppet := portal.bridge.GetPuppetByJID(jid)
 		changed = levels.EnsureUserLevel(puppet.MXID, newLevel) || changed
@@ -1090,7 +1100,8 @@ func (portal *Portal) RestrictMessageSending(restrict bool) id.EventID {
 		newLevel = 50
 	}
 
-	if levels.EventsDefault == newLevel {
+	changed := portal.applyPowerLevelFixes(levels)
+	if levels.EventsDefault == newLevel && !changed {
 		return ""
 	}
 
@@ -1113,7 +1124,7 @@ func (portal *Portal) RestrictMetadataChanges(restrict bool) id.EventID {
 	if restrict {
 		newLevel = 50
 	}
-	changed := false
+	changed := portal.applyPowerLevelFixes(levels)
 	changed = levels.EnsureEventLevel(event.StateRoomName, newLevel) || changed
 	changed = levels.EnsureEventLevel(event.StateRoomAvatar, newLevel) || changed
 	changed = levels.EnsureEventLevel(event.StateTopic, newLevel) || changed
@@ -1224,8 +1235,8 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 			// before creating the matrix room
 			if errors.Is(err, whatsmeow.ErrNotInGroup) {
 				user.log.Debugfln("Skipping creating matrix room for %s because the user is not a participant", portal.Key.JID)
-				user.bridge.DB.BackfillQuery.DeleteAllForPortal(user.MXID, portal.Key)
-				user.bridge.DB.HistorySyncQuery.DeleteAllMessagesForPortal(user.MXID, portal.Key)
+				user.bridge.DB.Backfill.DeleteAllForPortal(user.MXID, portal.Key)
+				user.bridge.DB.HistorySync.DeleteAllMessagesForPortal(user.MXID, portal.Key)
 				return err
 			} else if err != nil {
 				portal.log.Warnfln("Failed to get group info through %s: %v", user.JID, err)
@@ -2180,7 +2191,7 @@ func (portal *Portal) convertMediaMessage(intent *appservice.IntentAPI, source *
 		converted.MediaKey = msg.GetMediaKey()
 
 		errorText := fmt.Sprintf("Old %s.", typeName)
-		if portal.bridge.Config.Bridge.HistorySync.AutoRequestMedia && isBackfill {
+		if portal.bridge.Config.Bridge.HistorySync.MediaRequests.AutoRequestMedia && isBackfill {
 			errorText += " Media will be automatically requested from your phone later."
 		} else {
 			errorText += ` React with the \u267b (recycle) emoji to request this media from your phone.`
@@ -2348,23 +2359,29 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 	msg.UpdateMXID(resp.EventID, database.MsgNormal, database.MsgNoError)
 }
 
-func (portal *Portal) requestMediaRetry(user *User, eventID id.EventID) bool {
+func (portal *Portal) requestMediaRetry(user *User, eventID id.EventID, mediaKey []byte) (bool, error) {
 	msg := portal.bridge.DB.Message.GetByMXID(eventID)
 	if msg == nil {
-		portal.log.Debugfln("%s requested a media retry for unknown event %s", user.MXID, eventID)
-		return false
+		err := errors.New(fmt.Sprintf("%s requested a media retry for unknown event %s", user.MXID, eventID))
+		portal.log.Debugfln(err.Error())
+		return false, err
 	} else if msg.Error != database.MsgErrMediaNotFound {
-		portal.log.Debugfln("%s requested a media retry for non-errored event %s", user.MXID, eventID)
-		return false
+		err := errors.New(fmt.Sprintf("%s requested a media retry for non-errored event %s", user.MXID, eventID))
+		portal.log.Debugfln(err.Error())
+		return false, err
 	}
 
-	evt, err := portal.fetchMediaRetryEvent(msg)
-	if err != nil {
-		portal.log.Warnfln("Can't send media retry request for %s: %v", msg.JID, err)
-		return true
+	// If the media key is not provided, grab it from the event in Matrix
+	if mediaKey == nil {
+		evt, err := portal.fetchMediaRetryEvent(msg)
+		if err != nil {
+			portal.log.Warnfln("Can't send media retry request for %s: %v", msg.JID, err)
+			return true, nil
+		}
+		mediaKey = evt.Media.Key
 	}
 
-	err = user.Client.SendMediaRetryReceipt(&types.MessageInfo{
+	err := user.Client.SendMediaRetryReceipt(&types.MessageInfo{
 		ID: msg.JID,
 		MessageSource: types.MessageSource{
 			IsFromMe: msg.Sender.User == user.JID.User,
@@ -2372,13 +2389,13 @@ func (portal *Portal) requestMediaRetry(user *User, eventID id.EventID) bool {
 			Sender:   msg.Sender,
 			Chat:     portal.Key.JID,
 		},
-	}, evt.Media.Key)
+	}, mediaKey)
 	if err != nil {
 		portal.log.Warnfln("Failed to send media retry request for %s: %v", msg.JID, err)
 	} else {
 		portal.log.Debugfln("Sent media retry request for %s", msg.JID)
 	}
-	return true
+	return true, err
 }
 
 const thumbnailMaxSize = 72
@@ -2885,7 +2902,6 @@ func (portal *Portal) sendReactionToWhatsApp(sender *User, id types.MessageID, t
 				Participant: messageKeyParticipant,
 			},
 			Text:              proto.String(key),
-			GroupingKey:       proto.String(key), // TODO is this correct?
 			SenderTimestampMs: proto.Int64(timestamp),
 		},
 	})
