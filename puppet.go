@@ -33,6 +33,7 @@ import (
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/id"
 
+	"maunium.net/go/mautrix-whatsapp/config"
 	"maunium.net/go/mautrix-whatsapp/database"
 )
 
@@ -279,7 +280,7 @@ func (puppet *Puppet) updatePortalAvatar() {
 		}
 		portal.AvatarURL = puppet.AvatarURL
 		portal.Avatar = puppet.Avatar
-		portal.Update()
+		portal.Update(nil)
 	})
 }
 
@@ -292,12 +293,12 @@ func (puppet *Puppet) updatePortalName() {
 			}
 		}
 		portal.Name = puppet.Displayname
-		portal.Update()
+		portal.Update(nil)
 	})
 }
 
-func (puppet *Puppet) SyncContact(source *User, onlyIfNoName bool, reason string) {
-	if onlyIfNoName && len(puppet.Displayname) > 0 {
+func (puppet *Puppet) SyncContact(source *User, onlyIfNoName, shouldHavePushName bool, reason string) {
+	if onlyIfNoName && len(puppet.Displayname) > 0 && (!shouldHavePushName || puppet.NameQuality > config.NameQualityPhone) {
 		return
 	}
 

@@ -66,7 +66,7 @@ var (
 
 var (
 	// Version is the version number of the bridge. Changed manually when making a release.
-	Version = "0.3.1"
+	Version = "0.4.0"
 	// WAVersion is the version number exposed to WhatsApp. Filled in init()
 	WAVersion = ""
 	// VersionString is the bridge version, plus commit information. Filled in init() using the build-time values.
@@ -271,6 +271,12 @@ func (bridge *Bridge) Init() {
 	bridge.Log.Debugln("Initializing state store")
 	bridge.StateStore = database.NewSQLStateStore(bridge.DB)
 	bridge.AS.StateStore = bridge.StateStore
+
+	Segment.log = bridge.Log.Sub("Segment")
+	Segment.key = bridge.Config.SegmentKey
+	if Segment.IsEnabled() {
+		Segment.log.Infoln("Segment metrics are enabled")
+	}
 
 	bridge.WAContainer = sqlstore.NewWithDB(bridge.DB.DB, bridge.Config.AppService.Database.Type, nil)
 	bridge.WAContainer.DatabaseErrorHandler = bridge.DB.HandleSignalStoreError

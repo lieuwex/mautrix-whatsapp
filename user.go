@@ -18,6 +18,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -332,15 +335,30 @@ func (w *waLogger) Sub(module string) waLog.Logger         { return &waLogger{l:
 
 var ErrAlreadyLoggedIn = errors.New("already logged in")
 
+func (user *User) obfuscateJID(jid types.JID) string {
+	// Turn the first 4 bytes of HMAC-SHA256(hs_token, phone) into a number and replace the middle of the actual phone with that deterministic random number.
+	randomNumber := binary.BigEndian.Uint32(hmac.New(sha256.New, []byte(user.bridge.Config.AppService.HSToken)).Sum([]byte(jid.User))[:4])
+	return fmt.Sprintf("+%s-%d-%s:%d", jid.User[:1], randomNumber, jid.User[len(jid.User)-2:], jid.Device)
+}
+
 func (user *User) createClient(sess *store.Device) {
 	user.Client = whatsmeow.NewClient(sess, &waLogger{user.log.Sub("Client")})
 	user.Client.AddEventHandler(user.HandleEvent)
 	user.Client.SetForceActiveDeliveryReceipts(user.bridge.Config.Bridge.ForceActiveDeliveryReceipts)
-	user.Client.GetMessageForRetry = func(to types.JID, id types.MessageID) *waProto.Message {
+	user.Client.GetMessageForRetry = func(requester, to types.JID, id types.MessageID) *waProto.Message {
+		Segment.Track(user.MXID, "WhatsApp incoming retry (message not found)", map[string]interface{}{
+			"requester": user.obfuscateJID(requester),
+			"messageID": id,
+		})
 		user.bridge.Metrics.TrackRetryReceipt(0, false)
 		return nil
 	}
-	user.Client.PreRetryCallback = func(receipt *events.Receipt, retryCount int, msg *waProto.Message) bool {
+	user.Client.PreRetryCallback = func(receipt *events.Receipt, messageID types.MessageID, retryCount int, msg *waProto.Message) bool {
+		Segment.Track(user.MXID, "WhatsApp incoming retry (accepted)", map[string]interface{}{
+			"requester":  user.obfuscateJID(receipt.Sender),
+			"messageID":  messageID,
+			"retryCount": retryCount,
+		})
 		user.bridge.Metrics.TrackRetryReceipt(retryCount, true)
 		return true
 	}
@@ -506,15 +524,29 @@ const PhoneDisconnectPingTime = 10 * 24 * time.Hour
 const PhoneMinPingInterval = 24 * time.Hour
 
 func (user *User) sendHackyPhonePing() {
-	msgID := whatsmeow.GenerateMessageID()
 	user.PhoneLastPinged = time.Now()
+	msgID := whatsmeow.GenerateMessageID()
+	keyIDs := make([]*waProto.AppStateSyncKeyId, 0, 1)
+	lastKeyID, err := user.GetLastAppStateKeyID()
+	if lastKeyID != nil {
+		keyIDs = append(keyIDs, &waProto.AppStateSyncKeyId{
+			KeyId: lastKeyID,
+		})
+	} else {
+		user.log.Warnfln("Failed to get last app state key ID to send hacky phone ping: %v - sending empty request", err)
+	}
 	ts, err := user.Client.SendMessage(user.JID.ToNonAD(), msgID, &waProto.Message{
-		ProtocolMessage: &waProto.ProtocolMessage{},
+		ProtocolMessage: &waProto.ProtocolMessage{
+			Type: waProto.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST.Enum(),
+			AppStateSyncKeyRequest: &waProto.AppStateSyncKeyRequest{
+				KeyIds: keyIDs,
+			},
+		},
 	})
 	if err != nil {
 		user.log.Warnfln("Failed to send hacky phone ping: %v", err)
 	} else {
-		user.log.Debugfln("Sent hacky phone ping %s/%s because phone has been offline for >10 days", msgID, ts)
+		user.log.Debugfln("Sent hacky phone ping %s/%s because phone has been offline for >10 days", msgID, ts.Unix())
 		user.PhoneLastPinged = ts
 		user.Update()
 	}
@@ -745,6 +777,10 @@ func (user *User) HandleEvent(event interface{}) {
 	case *events.KeepAliveRestored:
 		user.log.Infof("Keepalive restored after timeouts, sending connected event")
 		go user.sendBridgeState(BridgeState{StateEvent: StateConnected})
+	case *events.MarkChatAsRead:
+		if user.bridge.Config.Bridge.SyncManualMarkedUnread {
+			user.markUnread(user.GetPortalByJID(v.JID), !v.Action.GetRead())
+		}
 	default:
 		user.log.Debugfln("Unknown type of event in HandleEvent: %T", v)
 	}
@@ -955,7 +991,7 @@ func (user *User) GetPortalByJID(jid types.JID) *Portal {
 }
 
 func (user *User) syncPuppet(jid types.JID, reason string) {
-	user.bridge.GetPuppetByJID(jid).SyncContact(user, false, reason)
+	user.bridge.GetPuppetByJID(jid).SyncContact(user, false, false, reason)
 }
 
 func (user *User) ResyncContacts() error {
@@ -1064,6 +1100,29 @@ func (user *User) markSelfReadFull(portal *Portal) {
 	}
 }
 
+func (user *User) markUnread(portal *Portal, unread bool) {
+	puppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
+	if puppet == nil || puppet.CustomIntent() == nil {
+		return
+	}
+
+	err := puppet.CustomIntent().SetRoomAccountData(portal.MXID, "m.marked_unread",
+		map[string]bool{"unread": unread})
+	if err != nil {
+		user.log.Warnfln("Failed to mark %s as unread via m.marked_unread: %v", portal.MXID, err)
+	} else {
+		user.log.Debugfln("Marked %s as unread via m.marked_unread: %v", portal.MXID, err)
+	}
+
+	err = puppet.CustomIntent().SetRoomAccountData(portal.MXID, "com.famedly.marked_unread",
+		map[string]bool{"unread": unread})
+	if err != nil {
+		user.log.Warnfln("Failed to mark %s as unread via com.famedly.marked_unread: %v", portal.MXID, err)
+	} else {
+		user.log.Debugfln("Marked %s as unread via com.famedly.marked_unread: %v", portal.MXID, err)
+	}
+}
+
 func (user *User) handleGroupCreate(evt *events.JoinedGroup) {
 	portal := user.GetPortalByJID(evt.JID)
 	if len(portal.MXID) == 0 {
@@ -1124,7 +1183,7 @@ func (user *User) handlePictureUpdate(evt *events.Picture) {
 func (user *User) StartPM(jid types.JID, reason string) (*Portal, *Puppet, bool, error) {
 	user.log.Debugln("Starting PM with", jid, "from", reason)
 	puppet := user.bridge.GetPuppetByJID(jid)
-	puppet.SyncContact(user, true, reason)
+	puppet.SyncContact(user, true, false, reason)
 	portal := user.GetPortalByJID(puppet.JID)
 	if len(portal.MXID) > 0 {
 		ok := portal.ensureUserInvited(user)

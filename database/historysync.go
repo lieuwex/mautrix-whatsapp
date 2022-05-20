@@ -80,8 +80,8 @@ func (hsq *HistorySyncQuery) NewConversationWithValues(
 		UserID:                   userID,
 		ConversationID:           conversationID,
 		PortalKey:                portalKey,
-		LastMessageTimestamp:     time.Unix(int64(lastMessageTimestamp), 0),
-		MuteEndTime:              time.Unix(int64(muteEndTime), 0),
+		LastMessageTimestamp:     time.Unix(int64(lastMessageTimestamp), 0).UTC(),
+		MuteEndTime:              time.Unix(int64(muteEndTime), 0).UTC(),
 		Archived:                 archived,
 		Pinned:                   pinned,
 		DisappearingMode:         disappearingMode,
@@ -115,20 +115,11 @@ func (hsc *HistorySyncConversation) Upsert() {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (user_mxid, conversation_id)
 		DO UPDATE SET
-			portal_jid=EXCLUDED.portal_jid,
-			portal_receiver=EXCLUDED.portal_receiver,
 			last_message_timestamp=CASE
 				WHEN EXCLUDED.last_message_timestamp > history_sync_conversation.last_message_timestamp THEN EXCLUDED.last_message_timestamp
 				ELSE history_sync_conversation.last_message_timestamp
 			END,
-			archived=EXCLUDED.archived,
-			pinned=EXCLUDED.pinned,
-			mute_end_time=EXCLUDED.mute_end_time,
-			disappearing_mode=EXCLUDED.disappearing_mode,
-			end_of_history_transfer_type=EXCLUDED.end_of_history_transfer_type,
-			ephemeral_expiration=EXCLUDED.ephemeral_expiration,
-			marked_as_unread=EXCLUDED.marked_as_unread,
-			unread_count=EXCLUDED.unread_count
+			end_of_history_transfer_type=EXCLUDED.end_of_history_transfer_type
 	`,
 		hsc.UserID,
 		hsc.ConversationID,
@@ -201,9 +192,11 @@ func (hsq *HistorySyncQuery) GetConversation(userID id.UserID, portalKey *Portal
 	return
 }
 
-func (hsq *HistorySyncQuery) DeleteAllConversations(userID id.UserID) error {
+func (hsq *HistorySyncQuery) DeleteAllConversations(userID id.UserID) {
 	_, err := hsq.db.Exec("DELETE FROM history_sync_conversation WHERE user_mxid=$1", userID)
-	return err
+	if err != nil {
+		hsq.log.Warnfln("Failed to delete historical chat info for %s/%s: %v", userID, err)
+	}
 }
 
 const (
@@ -249,10 +242,10 @@ func (hsq *HistorySyncQuery) NewMessageWithValues(userID id.UserID, conversation
 
 func (hsm *HistorySyncMessage) Insert() {
 	_, err := hsm.db.Exec(`
-		INSERT INTO history_sync_message (user_mxid, conversation_id, message_id, timestamp, data)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO history_sync_message (user_mxid, conversation_id, message_id, timestamp, data, inserted_time)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (user_mxid, conversation_id, message_id) DO NOTHING
-	`, hsm.UserID, hsm.ConversationID, hsm.MessageID, hsm.Timestamp, hsm.Data)
+	`, hsm.UserID, hsm.ConversationID, hsm.MessageID, hsm.Timestamp, hsm.Data, time.Now())
 	if err != nil {
 		hsm.log.Warnfln("Failed to insert history sync message %s/%s: %v", hsm.ConversationID, hsm.Timestamp, err)
 	}
@@ -310,17 +303,19 @@ func (hsq *HistorySyncQuery) DeleteMessages(userID id.UserID, conversationID str
 	return err
 }
 
-func (hsq *HistorySyncQuery) DeleteAllMessages(userID id.UserID) error {
+func (hsq *HistorySyncQuery) DeleteAllMessages(userID id.UserID) {
 	_, err := hsq.db.Exec("DELETE FROM history_sync_message WHERE user_mxid=$1", userID)
-	return err
+	if err != nil {
+		hsq.log.Warnfln("Failed to delete historical messages for %s: %v", userID, err)
+	}
 }
 
-func (hsq *HistorySyncQuery) DeleteAllMessagesForPortal(userID id.UserID, portalKey PortalKey) error {
+func (hsq *HistorySyncQuery) DeleteAllMessagesForPortal(userID id.UserID, portalKey PortalKey) {
 	_, err := hsq.db.Exec(`
 		DELETE FROM history_sync_message
-		WHERE user_mxid=$1
-			AND portal_jid=$2
-			AND portal_receiver=$3
-	`, userID, portalKey.JID, portalKey.Receiver)
-	return err
+		WHERE user_mxid=$1 AND conversation_id=$2
+	`, userID, portalKey.JID)
+	if err != nil {
+		hsq.log.Warnfln("Failed to delete historical messages for %s/%s: %v", userID, portalKey.JID, err)
+	}
 }

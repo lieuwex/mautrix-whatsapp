@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -482,7 +483,7 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 		return portal.convertGroupInviteMessage(intent, info, waMsg.GetGroupInviteMessage())
 	case waMsg.ProtocolMessage != nil && waMsg.ProtocolMessage.GetType() == waProto.ProtocolMessage_EPHEMERAL_SETTING:
 		portal.ExpirationTime = waMsg.ProtocolMessage.GetEphemeralExpiration()
-		portal.Update()
+		portal.Update(nil)
 		return &ConvertedMessage{
 			Intent: intent,
 			Type:   event.EventMessage,
@@ -497,8 +498,11 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 }
 
 func (portal *Portal) UpdateGroupDisappearingMessages(sender *types.JID, timestamp time.Time, timer uint32) {
+	if portal.ExpirationTime == timer {
+		return
+	}
 	portal.ExpirationTime = timer
-	portal.Update()
+	portal.Update(nil)
 	intent := portal.MainIntent()
 	if sender != nil {
 		intent = portal.bridge.GetPuppetByJID(sender.ToNonAD()).IntentFor(portal)
@@ -547,8 +551,18 @@ func (portal *Portal) handleUndecryptableMessage(source *User, evt *events.Undec
 		portal.log.Debugfln("Not handling %s (undecryptable): message is duplicate", evt.Info.ID)
 		return
 	}
+	metricType := "error"
+	if evt.IsUnavailable {
+		metricType = "unavailable"
+	}
+	Segment.Track(source.MXID, "WhatsApp undecryptable message", map[string]interface{}{
+		"messageID":         evt.Info.ID,
+		"undecryptableType": metricType,
+	})
 	intent := portal.getMessageIntent(source, &evt.Info)
-	if !intent.IsCustomPuppet && portal.IsPrivateChat() && evt.Info.Sender.User == portal.Key.Receiver.User {
+	if intent == nil {
+		return
+	} else if !intent.IsCustomPuppet && portal.IsPrivateChat() && evt.Info.Sender.User == portal.Key.Receiver.User {
 		portal.log.Debugfln("Not handling %s (undecryptable): user doesn't have double puppeting enabled", evt.Info.ID)
 		return
 	}
@@ -611,6 +625,9 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 	existingMsg := portal.bridge.DB.Message.GetByJID(portal.Key, msgID)
 	if existingMsg != nil {
 		if existingMsg.Error == database.MsgErrDecryptionFailed {
+			Segment.Track(source.MXID, "WhatsApp undecryptable message resolved", map[string]interface{}{
+				"messageID": evt.Info.ID,
+			})
 			portal.log.Debugfln("Got decryptable version of previously undecryptable message %s (%s)", msgID, msgType)
 		} else {
 			portal.log.Debugfln("Not handling %s (%s): message is duplicate", msgID, msgType)
@@ -619,7 +636,9 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 	}
 
 	intent := portal.getMessageIntent(source, &evt.Info)
-	if !intent.IsCustomPuppet && portal.IsPrivateChat() && evt.Info.Sender.User == portal.Key.Receiver.User {
+	if intent == nil {
+		return
+	} else if !intent.IsCustomPuppet && portal.IsPrivateChat() && evt.Info.Sender.User == portal.Key.Receiver.User {
 		portal.log.Debugfln("Not handling %s (%s): user doesn't have double puppeting enabled", msgID, msgType)
 		return
 	}
@@ -676,7 +695,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			_, _ = portal.MainIntent().RedactEvent(portal.MXID, existingMsg.MXID, mautrix.ReqRedact{
 				Reason: "The undecryptable message was actually the deletion of another message",
 			})
-			existingMsg.UpdateMXID("net.maunium.whatsapp.fake::"+existingMsg.MXID, database.MsgFake, database.MsgNoError)
+			existingMsg.UpdateMXID(nil, "net.maunium.whatsapp.fake::"+existingMsg.MXID, database.MsgFake, database.MsgNoError)
 		}
 	} else {
 		portal.log.Warnfln("Unhandled message: %+v (%s)", evt.Info, msgType)
@@ -684,7 +703,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			_, _ = portal.MainIntent().RedactEvent(portal.MXID, existingMsg.MXID, mautrix.ReqRedact{
 				Reason: "The undecryptable message contained an unsupported message type",
 			})
-			existingMsg.UpdateMXID("net.maunium.whatsapp.fake::"+existingMsg.MXID, database.MsgFake, database.MsgNoError)
+			existingMsg.UpdateMXID(nil, "net.maunium.whatsapp.fake::"+existingMsg.MXID, database.MsgFake, database.MsgNoError)
 		}
 		return
 	}
@@ -702,7 +721,7 @@ func (portal *Portal) isRecentlyHandled(id types.MessageID, error database.Messa
 	return false
 }
 
-func (portal *Portal) markHandled(msg *database.Message, info *types.MessageInfo, mxid id.EventID, isSent, recent bool, msgType database.MessageType, error database.MessageErrorType) *database.Message {
+func (portal *Portal) markHandled(txn *sql.Tx, msg *database.Message, info *types.MessageInfo, mxid id.EventID, isSent, recent bool, msgType database.MessageType, errType database.MessageErrorType) *database.Message {
 	if msg == nil {
 		msg = portal.bridge.DB.Message.New()
 		msg.Chat = portal.Key
@@ -712,13 +731,13 @@ func (portal *Portal) markHandled(msg *database.Message, info *types.MessageInfo
 		msg.Sender = info.Sender
 		msg.Sent = isSent
 		msg.Type = msgType
-		msg.Error = error
+		msg.Error = errType
 		if info.IsIncomingBroadcast() {
 			msg.BroadcastListJID = info.Chat
 		}
-		msg.Insert()
+		msg.Insert(txn)
 	} else {
-		msg.UpdateMXID(mxid, msgType, error)
+		msg.UpdateMXID(txn, mxid, msgType, errType)
 	}
 
 	if recent {
@@ -726,7 +745,7 @@ func (portal *Portal) markHandled(msg *database.Message, info *types.MessageInfo
 		index := portal.recentlyHandledIndex
 		portal.recentlyHandledIndex = (portal.recentlyHandledIndex + 1) % recentlyHandledLength
 		portal.recentlyHandledLock.Unlock()
-		portal.recentlyHandled[index] = recentlyHandledWrapper{msg.JID, error}
+		portal.recentlyHandled[index] = recentlyHandledWrapper{msg.JID, errType}
 	}
 	return msg
 }
@@ -738,22 +757,30 @@ func (portal *Portal) getMessagePuppet(user *User, info *types.MessageInfo) *Pup
 		return portal.bridge.GetPuppetByJID(portal.Key.JID)
 	} else {
 		puppet := portal.bridge.GetPuppetByJID(info.Sender)
-		puppet.SyncContact(user, true, "handling message")
+		if puppet == nil {
+			portal.log.Warnfln("Message %+v doesn't seem to have a valid sender (%s): puppet is nil", *info, info.Sender)
+			return nil
+		}
+		puppet.SyncContact(user, true, true, "handling message")
 		return puppet
 	}
 }
 
 func (portal *Portal) getMessageIntent(user *User, info *types.MessageInfo) *appservice.IntentAPI {
-	return portal.getMessagePuppet(user, info).IntentFor(portal)
+	puppet := portal.getMessagePuppet(user, info)
+	if puppet == nil {
+		return nil
+	}
+	return puppet.IntentFor(portal)
 }
 
-func (portal *Portal) finishHandling(existing *database.Message, message *types.MessageInfo, mxid id.EventID, msgType database.MessageType, error database.MessageErrorType) {
-	portal.markHandled(existing, message, mxid, true, true, msgType, error)
+func (portal *Portal) finishHandling(existing *database.Message, message *types.MessageInfo, mxid id.EventID, msgType database.MessageType, errType database.MessageErrorType) {
+	portal.markHandled(nil, existing, message, mxid, true, true, msgType, errType)
 	portal.sendDeliveryReceipt(mxid)
 	var suffix string
-	if error == database.MsgErrDecryptionFailed {
+	if errType == database.MsgErrDecryptionFailed {
 		suffix = "(undecryptable message error notice)"
-	} else if error == database.MsgErrMediaNotFound {
+	} else if errType == database.MsgErrMediaNotFound {
 		suffix = "(media not found notice)"
 	}
 	portal.log.Debugfln("Handled message %s (%s) -> %s %s", message.ID, msgType, mxid, suffix)
@@ -809,7 +836,7 @@ func (portal *Portal) SyncParticipants(source *User, metadata *types.GroupInfo) 
 	for _, participant := range metadata.Participants {
 		participantMap[participant.JID] = true
 		puppet := portal.bridge.GetPuppetByJID(participant.JID)
-		puppet.SyncContact(source, true, "group participant")
+		puppet.SyncContact(source, true, false, "group participant")
 		user := portal.bridge.GetUserByJID(participant.JID)
 		if user != nil && user != source {
 			portal.ensureUserInvited(user)
@@ -1019,7 +1046,7 @@ func (portal *Portal) UpdateMatrixRoom(user *User, groupInfo *types.GroupInfo) b
 		update = portal.UpdateAvatar(user, types.EmptyJID, false) || update
 	}
 	if update {
-		portal.Update()
+		portal.Update(nil)
 		portal.UpdateBridgeInfo()
 	}
 	return true
@@ -1194,7 +1221,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	//var broadcastMetadata *types.BroadcastListInfo
 	if portal.IsPrivateChat() {
 		puppet := portal.bridge.GetPuppetByJID(portal.Key.JID)
-		puppet.SyncContact(user, true, "creating private chat portal")
+		puppet.SyncContact(user, true, false, "creating private chat portal")
 		if portal.bridge.Config.Bridge.PrivateChatPortalMeta {
 			portal.Name = puppet.Displayname
 			portal.AvatarURL = puppet.AvatarURL
@@ -1311,7 +1338,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 		return err
 	}
 	portal.MXID = resp.RoomID
-	portal.Update()
+	portal.Update(nil)
 	portal.bridge.portalsLock.Lock()
 	portal.bridge.portalsByMXID[portal.MXID] = portal
 	portal.bridge.portalsLock.Unlock()
@@ -1329,7 +1356,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	if groupInfo != nil {
 		if groupInfo.IsEphemeral {
 			portal.ExpirationTime = groupInfo.DisappearingTimer
-			portal.Update()
+			portal.Update(nil)
 		}
 		portal.SyncParticipants(user, groupInfo)
 		if groupInfo.IsAnnounce {
@@ -1360,14 +1387,14 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 		portal.log.Errorln("Failed to send dummy event to mark portal creation:", err)
 	} else {
 		portal.FirstEventID = firstEventResp.EventID
-		portal.Update()
+		portal.Update(nil)
 	}
 
 	if user.bridge.Config.Bridge.HistorySync.Backfill && backfill {
 		portals := []*Portal{portal}
 		user.EnqueueImmedateBackfills(portals)
 		user.EnqueueDeferredBackfills(portals)
-		user.BackfillQueue.ReCheckQueue <- true
+		user.BackfillQueue.ReCheck()
 	}
 	return nil
 }
@@ -1879,7 +1906,7 @@ func (portal *Portal) HandleWhatsAppInvite(source *User, senderJID *types.JID, j
 	}
 	for _, jid := range jids {
 		puppet := portal.bridge.GetPuppetByJID(jid)
-		puppet.SyncContact(source, true, "handling whatsapp invite")
+		puppet.SyncContact(source, true, false, "handling whatsapp invite")
 		content := event.Content{
 			Parsed: event.MemberEventContent{
 				Membership:  "invite",
@@ -1931,7 +1958,11 @@ func shallowCopyMap(data map[string]interface{}) map[string]interface{} {
 }
 
 func (portal *Portal) makeMediaBridgeFailureMessage(info *types.MessageInfo, bridgeErr error, converted *ConvertedMessage, keys *FailedMediaKeys, userFriendlyError string) *ConvertedMessage {
-	portal.log.Errorfln("Failed to bridge media for %s: %v", info.ID, bridgeErr)
+	if errors.Is(bridgeErr, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(bridgeErr, whatsmeow.ErrMediaDownloadFailedWith410) {
+		portal.log.Debugfln("Failed to bridge media for %s: %v", info.ID, bridgeErr)
+	} else {
+		portal.log.Errorfln("Failed to bridge media for %s: %v", info.ID, bridgeErr)
+	}
 	if keys != nil {
 		meta := &FailedMediaMeta{
 			Type:         converted.Type,
@@ -2315,14 +2346,18 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 		return
 	} else if retryData.GetResult() != waProto.MediaRetryNotification_SUCCESS {
 		errorName := waProto.MediaRetryNotification_MediaRetryNotificationResultType_name[int32(retryData.GetResult())]
-		portal.log.Warnfln("Got error response in media retry notification for %s: %s", retry.MessageID, errorName)
-		portal.log.Debugfln("Error response contents: %s / %s", retryData.GetStanzaId(), retryData.GetDirectPath())
-		if retryData.GetResult() == waProto.MediaRetryNotification_NOT_FOUND {
-			portal.sendMediaRetryFailureEdit(intent, msg, whatsmeow.ErrMediaNotAvailableOnPhone)
+		if retryData.GetDirectPath() == "" {
+			portal.log.Warnfln("Got error response in media retry notification for %s: %s", retry.MessageID, errorName)
+			portal.log.Debugfln("Error response contents: %+v", retryData)
+			if retryData.GetResult() == waProto.MediaRetryNotification_NOT_FOUND {
+				portal.sendMediaRetryFailureEdit(intent, msg, whatsmeow.ErrMediaNotAvailableOnPhone)
+			} else {
+				portal.sendMediaRetryFailureEdit(intent, msg, fmt.Errorf("phone sent error response: %s", errorName))
+			}
+			return
 		} else {
-			portal.sendMediaRetryFailureEdit(intent, msg, fmt.Errorf("phone sent error response: %s", errorName))
+			portal.log.Debugfln("Got error response %s in media retry notification for %s, but response also contains a new download URL - trying to download", retry.MessageID, errorName)
 		}
-		return
 	}
 
 	data, err := source.Client.DownloadMediaWithPath(retryData.GetDirectPath(), meta.Media.EncSHA256, meta.Media.SHA256, meta.Media.Key, meta.Media.Length, meta.Media.Type, "")
@@ -2356,7 +2391,7 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 		return
 	}
 	portal.log.Debugfln("Successfully edited %s -> %s after retry notification for %s", msg.MXID, resp.EventID, retry.MessageID)
-	msg.UpdateMXID(resp.EventID, database.MsgNormal, database.MsgNoError)
+	msg.UpdateMXID(nil, resp.EventID, database.MsgNormal, database.MsgNoError)
 }
 
 func (portal *Portal) requestMediaRetry(user *User, eventID id.EventID, mediaKey []byte) (bool, error) {
@@ -2833,7 +2868,7 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 	}
 	portal.MarkDisappearing(evt.ID, portal.ExpirationTime, true)
 	info := portal.generateMessageInfo(sender)
-	dbMsg := portal.markHandled(nil, info, evt.ID, false, true, database.MsgNormal, database.MsgNoError)
+	dbMsg := portal.markHandled(nil, nil, info, evt.ID, false, true, database.MsgNormal, database.MsgNoError)
 	portal.log.Debugln("Sending event", evt.ID, "to WhatsApp", info.ID)
 	ts, err := sender.Client.SendMessage(portal.Key.JID, info.ID, msg)
 	if err != nil {
@@ -2877,7 +2912,7 @@ func (portal *Portal) handleMatrixReaction(sender *User, evt *event.Event) error
 		return fmt.Errorf("unknown target event %s", content.RelatesTo.EventID)
 	}
 	info := portal.generateMessageInfo(sender)
-	dbMsg := portal.markHandled(nil, info, evt.ID, false, true, database.MsgReaction, database.MsgNoError)
+	dbMsg := portal.markHandled(nil, nil, info, evt.ID, false, true, database.MsgReaction, database.MsgNoError)
 	portal.upsertReaction(nil, target.JID, sender.JID, evt.ID, info.ID)
 	portal.log.Debugln("Sending reaction", evt.ID, "to WhatsApp", info.ID)
 	ts, err := portal.sendReactionToWhatsApp(sender, info.ID, target, content.RelatesTo.Key, evt.Timestamp)
@@ -3291,6 +3326,6 @@ func (portal *Portal) HandleMatrixMeta(sender *User, evt *event.Event) {
 		portal.Avatar = newID
 		portal.AvatarURL = content.URL
 		portal.UpdateBridgeInfo()
-		portal.Update()
+		portal.Update(nil)
 	}
 }

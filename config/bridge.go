@@ -76,11 +76,12 @@ type BridgeConfig struct {
 	UserAvatarSync    bool `yaml:"user_avatar_sync"`
 	BridgeMatrixLeave bool `yaml:"bridge_matrix_leave"`
 
-	SyncWithCustomPuppets bool `yaml:"sync_with_custom_puppets"`
-	SyncDirectChatList    bool `yaml:"sync_direct_chat_list"`
-	DefaultBridgeReceipts bool `yaml:"default_bridge_receipts"`
-	DefaultBridgePresence bool `yaml:"default_bridge_presence"`
-	SendPresenceOnTyping  bool `yaml:"send_presence_on_typing"`
+	SyncWithCustomPuppets  bool `yaml:"sync_with_custom_puppets"`
+	SyncDirectChatList     bool `yaml:"sync_direct_chat_list"`
+	SyncManualMarkedUnread bool `yaml:"sync_manual_marked_unread"`
+	DefaultBridgeReceipts  bool `yaml:"default_bridge_receipts"`
+	DefaultBridgePresence  bool `yaml:"default_bridge_presence"`
+	SendPresenceOnTyping   bool `yaml:"send_presence_on_typing"`
 
 	ForceActiveDeliveryReceipts bool `yaml:"force_active_delivery_receipts"`
 
@@ -174,6 +175,12 @@ type legacyContactInfo struct {
 	JID    string
 }
 
+const (
+	NameQualityPush    = 3
+	NameQualityContact = 2
+	NameQualityPhone   = 1
+)
+
 func (bc BridgeConfig) FormatDisplayname(jid types.JID, contact types.ContactInfo) (string, int8) {
 	var buf strings.Builder
 	_ = bc.displaynameTemplate.Execute(&buf, legacyContactInfo{
@@ -188,11 +195,11 @@ func (bc BridgeConfig) FormatDisplayname(jid types.JID, contact types.ContactInf
 	var quality int8
 	switch {
 	case len(contact.PushName) > 0 || len(contact.BusinessName) > 0:
-		quality = 3
+		quality = NameQualityPush
 	case len(contact.FullName) > 0 || len(contact.FirstName) > 0:
-		quality = 2
+		quality = NameQualityContact
 	default:
-		quality = 1
+		quality = NameQualityPhone
 	}
 	return buf.String(), quality
 }
