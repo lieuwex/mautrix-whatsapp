@@ -5,19 +5,17 @@ go 1.17
 require (
 	github.com/gorilla/mux v1.8.0
 	github.com/gorilla/websocket v1.5.0
-	github.com/lib/pq v1.10.5
+	github.com/lib/pq v1.10.6
 	github.com/mattn/go-sqlite3 v1.14.13
 	github.com/prometheus/client_golang v1.12.2-0.20220514081015-5d584e2717ef
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/tidwall/gjson v1.14.1
-	go.mau.fi/whatsmeow v0.0.0-20220519090423-468ee95de7e7
+	go.mau.fi/whatsmeow v0.0.0-20220526084057-133d825afbab
 	golang.org/x/image v0.0.0-20220413100746-70e8d0d3baa9
 	golang.org/x/net v0.0.0-20220513224357-95641704303c
 	google.golang.org/protobuf v1.28.0
-	gopkg.in/yaml.v3 v3.0.0-20220512140231-539c8e751b99
-	maunium.net/go/mauflag v1.0.0
 	maunium.net/go/maulogger/v2 v2.3.2
-	maunium.net/go/mautrix v0.11.1-0.20220518174602-87d2cd49a4d1
+	maunium.net/go/mautrix v0.11.1-0.20220526113002-cf90afd2498e
 )
 
 require (
@@ -37,7 +35,8 @@ require (
 	golang.org/x/crypto v0.0.0-20220513210258-46612604a0f9 // indirect
 	golang.org/x/sys v0.0.0-20220328115105-d36c6a25d886 // indirect
 	golang.org/x/text v0.3.7 // indirect
-	gopkg.in/yaml.v2 v2.4.0 // indirect
+	gopkg.in/yaml.v3 v3.0.0 // indirect
+	maunium.net/go/mauflag v1.0.0 // indirect
 )
 
 // Exclude some things that cause go.sum to explode

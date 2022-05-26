@@ -40,11 +40,13 @@ import (
 	"golang.org/x/image/draw"
 	"golang.org/x/image/webp"
 	"google.golang.org/protobuf/proto"
+	"maunium.net/go/mautrix/bridge/bridgeconfig"
 
 	log "maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
+	"maunium.net/go/mautrix/bridge"
 	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
@@ -69,68 +71,91 @@ const PrivateChatTopic = "WhatsApp private chat"
 
 var ErrStatusBroadcastDisabled = errors.New("status bridging is disabled")
 
-func (bridge *Bridge) GetPortalByMXID(mxid id.RoomID) *Portal {
-	bridge.portalsLock.Lock()
-	defer bridge.portalsLock.Unlock()
-	portal, ok := bridge.portalsByMXID[mxid]
+func (br *WABridge) GetPortalByMXID(mxid id.RoomID) *Portal {
+	br.portalsLock.Lock()
+	defer br.portalsLock.Unlock()
+	portal, ok := br.portalsByMXID[mxid]
 	if !ok {
-		return bridge.loadDBPortal(bridge.DB.Portal.GetByMXID(mxid), nil)
+		return br.loadDBPortal(br.DB.Portal.GetByMXID(mxid), nil)
 	}
 	return portal
 }
 
-func (bridge *Bridge) GetPortalByJID(key database.PortalKey) *Portal {
-	bridge.portalsLock.Lock()
-	defer bridge.portalsLock.Unlock()
-	portal, ok := bridge.portalsByJID[key]
+func (br *WABridge) GetIPortal(mxid id.RoomID) bridge.Portal {
+	p := br.GetPortalByMXID(mxid)
+	if p == nil {
+		return nil
+	}
+	return p
+}
+
+func (portal *Portal) IsEncrypted() bool {
+	return portal.Encrypted
+}
+
+func (portal *Portal) MarkEncrypted() {
+	portal.Encrypted = true
+	portal.Update(nil)
+}
+
+func (portal *Portal) ReceiveMatrixEvent(user bridge.User, evt *event.Event) {
+	if user.GetPermissionLevel() >= bridgeconfig.PermissionLevelUser || portal.HasRelaybot() {
+		portal.matrixMessages <- PortalMatrixMessage{user: user.(*User), evt: evt}
+	}
+}
+
+func (br *WABridge) GetPortalByJID(key database.PortalKey) *Portal {
+	br.portalsLock.Lock()
+	defer br.portalsLock.Unlock()
+	portal, ok := br.portalsByJID[key]
 	if !ok {
-		return bridge.loadDBPortal(bridge.DB.Portal.GetByJID(key), &key)
+		return br.loadDBPortal(br.DB.Portal.GetByJID(key), &key)
 	}
 	return portal
 }
 
-func (bridge *Bridge) GetAllPortals() []*Portal {
-	return bridge.dbPortalsToPortals(bridge.DB.Portal.GetAll())
+func (br *WABridge) GetAllPortals() []*Portal {
+	return br.dbPortalsToPortals(br.DB.Portal.GetAll())
 }
 
-func (bridge *Bridge) GetAllPortalsForUser(userID id.UserID) []*Portal {
-	return bridge.dbPortalsToPortals(bridge.DB.Portal.GetAllForUser(userID))
+func (br *WABridge) GetAllPortalsForUser(userID id.UserID) []*Portal {
+	return br.dbPortalsToPortals(br.DB.Portal.GetAllForUser(userID))
 }
 
-func (bridge *Bridge) GetAllPortalsByJID(jid types.JID) []*Portal {
-	return bridge.dbPortalsToPortals(bridge.DB.Portal.GetAllByJID(jid))
+func (br *WABridge) GetAllPortalsByJID(jid types.JID) []*Portal {
+	return br.dbPortalsToPortals(br.DB.Portal.GetAllByJID(jid))
 }
 
-func (bridge *Bridge) dbPortalsToPortals(dbPortals []*database.Portal) []*Portal {
-	bridge.portalsLock.Lock()
-	defer bridge.portalsLock.Unlock()
+func (br *WABridge) dbPortalsToPortals(dbPortals []*database.Portal) []*Portal {
+	br.portalsLock.Lock()
+	defer br.portalsLock.Unlock()
 	output := make([]*Portal, len(dbPortals))
 	for index, dbPortal := range dbPortals {
 		if dbPortal == nil {
 			continue
 		}
-		portal, ok := bridge.portalsByJID[dbPortal.Key]
+		portal, ok := br.portalsByJID[dbPortal.Key]
 		if !ok {
-			portal = bridge.loadDBPortal(dbPortal, nil)
+			portal = br.loadDBPortal(dbPortal, nil)
 		}
 		output[index] = portal
 	}
 	return output
 }
 
-func (bridge *Bridge) loadDBPortal(dbPortal *database.Portal, key *database.PortalKey) *Portal {
+func (br *WABridge) loadDBPortal(dbPortal *database.Portal, key *database.PortalKey) *Portal {
 	if dbPortal == nil {
 		if key == nil {
 			return nil
 		}
-		dbPortal = bridge.DB.Portal.New()
+		dbPortal = br.DB.Portal.New()
 		dbPortal.Key = *key
 		dbPortal.Insert()
 	}
-	portal := bridge.NewPortal(dbPortal)
-	bridge.portalsByJID[portal.Key] = portal
+	portal := br.NewPortal(dbPortal)
+	br.portalsByJID[portal.Key] = portal
 	if len(portal.MXID) > 0 {
-		bridge.portalsByMXID[portal.MXID] = portal
+		br.portalsByMXID[portal.MXID] = portal
 	}
 	return portal
 }
@@ -139,14 +164,14 @@ func (portal *Portal) GetUsers() []*User {
 	return nil
 }
 
-func (bridge *Bridge) newBlankPortal(key database.PortalKey) *Portal {
+func (br *WABridge) newBlankPortal(key database.PortalKey) *Portal {
 	portal := &Portal{
-		bridge: bridge,
-		log:    bridge.Log.Sub(fmt.Sprintf("Portal/%s", key)),
+		bridge: br,
+		log:    br.Log.Sub(fmt.Sprintf("Portal/%s", key)),
 
-		messages:       make(chan PortalMessage, bridge.Config.Bridge.PortalMessageBuffer),
-		matrixMessages: make(chan PortalMatrixMessage, bridge.Config.Bridge.PortalMessageBuffer),
-		mediaRetries:   make(chan PortalMediaRetry, bridge.Config.Bridge.PortalMessageBuffer),
+		messages:       make(chan PortalMessage, br.Config.Bridge.PortalMessageBuffer),
+		matrixMessages: make(chan PortalMatrixMessage, br.Config.Bridge.PortalMessageBuffer),
+		mediaRetries:   make(chan PortalMediaRetry, br.Config.Bridge.PortalMessageBuffer),
 
 		mediaErrorCache: make(map[types.MessageID]*FailedMediaMeta),
 	}
@@ -154,15 +179,15 @@ func (bridge *Bridge) newBlankPortal(key database.PortalKey) *Portal {
 	return portal
 }
 
-func (bridge *Bridge) NewManualPortal(key database.PortalKey) *Portal {
-	portal := bridge.newBlankPortal(key)
-	portal.Portal = bridge.DB.Portal.New()
+func (br *WABridge) NewManualPortal(key database.PortalKey) *Portal {
+	portal := br.newBlankPortal(key)
+	portal.Portal = br.DB.Portal.New()
 	portal.Key = key
 	return portal
 }
 
-func (bridge *Bridge) NewPortal(dbPortal *database.Portal) *Portal {
-	portal := bridge.newBlankPortal(dbPortal.Key)
+func (br *WABridge) NewPortal(dbPortal *database.Portal) *Portal {
+	portal := br.newBlankPortal(dbPortal.Key)
 	portal.Portal = dbPortal
 	return portal
 }
@@ -203,7 +228,7 @@ type recentlyHandledWrapper struct {
 type Portal struct {
 	*database.Portal
 
-	bridge *Bridge
+	bridge *WABridge
 	log    log.Logger
 
 	roomCreateLock sync.Mutex
@@ -211,11 +236,11 @@ type Portal struct {
 	backfillLock   sync.Mutex
 	avatarLock     sync.Mutex
 
+	latestEventBackfillLock sync.Mutex
+
 	recentlyHandled      [recentlyHandledLength]recentlyHandledWrapper
 	recentlyHandledLock  sync.Mutex
 	recentlyHandledIndex uint8
-
-	privateChatBackfillInvitePuppet func()
 
 	currentlyTyping     []id.UserID
 	currentlyTypingLock sync.Mutex
@@ -242,27 +267,32 @@ func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
 			return
 		}
 	}
-	if msg.evt != nil {
+	portal.latestEventBackfillLock.Lock()
+	defer portal.latestEventBackfillLock.Unlock()
+	switch {
+	case msg.evt != nil:
 		portal.handleMessage(msg.source, msg.evt)
-	} else if msg.receipt != nil {
+	case msg.receipt != nil:
 		portal.handleReceipt(msg.receipt, msg.source)
-	} else if msg.undecryptable != nil {
+	case msg.undecryptable != nil:
 		portal.handleUndecryptableMessage(msg.source, msg.undecryptable)
-	} else if msg.fake != nil {
+	case msg.fake != nil:
 		msg.fake.ID = "FAKE::" + msg.fake.ID
 		portal.handleFakeMessage(*msg.fake)
-	} else {
+	default:
 		portal.log.Warnln("Unexpected PortalMessage with no message: %+v", msg)
 	}
 }
 
 func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
-	portal.HandleMatrixReadReceipt(msg.user, "", time.UnixMilli(msg.evt.Timestamp), false)
+	portal.handleMatrixReadReceipt(msg.user, "", time.UnixMilli(msg.evt.Timestamp), false)
 	switch msg.evt.Type {
 	case event.EventMessage, event.EventSticker:
 		portal.HandleMatrixMessage(msg.user, msg.evt)
 	case event.EventRedaction:
 		portal.HandleMatrixRedaction(msg.user, msg.evt)
+	case event.EventReaction:
+		portal.HandleMatrixReaction(msg.user, msg.evt)
 	default:
 		portal.log.Warnln("Unsupported event type %+v in portal message channel", msg.evt.Type)
 	}
@@ -651,6 +681,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			converted.Extra["fi.mau.whatsapp.source_broadcast_list"] = evt.Info.Chat.String()
 		}
 		var eventID id.EventID
+		var lastEventID id.EventID
 		if existingMsg != nil {
 			portal.MarkDisappearing(existingMsg.MXID, converted.ExpiresIn, false)
 			converted.Content.SetEdit(existingMsg.MXID)
@@ -663,6 +694,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		} else {
 			portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
 			eventID = resp.EventID
+			lastEventID = eventID
 		}
 		// TODO figure out how to handle captions with undecryptable messages turning decryptable
 		if converted.Caption != nil && existingMsg == nil {
@@ -671,7 +703,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 				portal.log.Errorfln("Failed to send caption of %s to Matrix: %v", msgID, err)
 			} else {
 				portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
-				//eventID = resp.EventID
+				lastEventID = resp.EventID
 			}
 		}
 		if converted.MultiEvent != nil && existingMsg == nil {
@@ -681,7 +713,16 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 					portal.log.Errorfln("Failed to send sub-event %d of %s to Matrix: %v", index+1, msgID, err)
 				} else {
 					portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
+					lastEventID = resp.EventID
 				}
+			}
+		}
+		if source.MXID == intent.UserID {
+			// There are some edge cases (like call notices) where previous messages aren't marked as read
+			// when the user sends a message from another device, so just mark the new message as read to be safe.
+			err = intent.SetReadMarkers(portal.MXID, makeReadMarkerContent(lastEventID, true))
+			if err != nil {
+				portal.log.Warnfln("Failed to mark own message %s as read by %s: %v", lastEventID, source.MXID, err)
 			}
 		}
 		if len(eventID) != 0 {
@@ -2890,6 +2931,21 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 }
 
 func (portal *Portal) HandleMatrixReaction(sender *User, evt *event.Event) {
+	if portal.IsPrivateChat() && sender.JID.User != portal.Key.Receiver.User {
+		return
+	}
+
+	content, ok := evt.Content.Parsed.(*event.ReactionEventContent)
+	if ok && strings.Contains(content.RelatesTo.Key, "retry") || strings.HasPrefix(content.RelatesTo.Key, "\u267b") { // ♻️
+		if retryRequested, _ := portal.requestMediaRetry(sender, content.RelatesTo.EventID, nil); retryRequested {
+			_, _ = portal.MainIntent().RedactEvent(portal.MXID, evt.ID, mautrix.ReqRedact{
+				Reason: "requested media from phone",
+			})
+			// Errored media, don't try to send as reaction
+			return
+		}
+	}
+
 	portal.log.Debugfln("Received reaction event %s from %s", evt.ID, evt.Sender)
 	err := portal.handleMatrixReaction(sender, evt)
 	if err != nil {
@@ -3026,7 +3082,11 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	}
 }
 
-func (portal *Portal) HandleMatrixReadReceipt(sender *User, eventID id.EventID, receiptTimestamp time.Time, isExplicit bool) {
+func (portal *Portal) HandleMatrixReadReceipt(sender bridge.User, eventID id.EventID, receiptTimestamp time.Time) {
+	portal.handleMatrixReadReceipt(sender.(*User), eventID, receiptTimestamp, true)
+}
+
+func (portal *Portal) handleMatrixReadReceipt(sender *User, eventID id.EventID, receiptTimestamp time.Time, isExplicit bool) {
 	if !sender.IsLoggedIn() {
 		if isExplicit {
 			portal.log.Debugfln("Ignoring read receipt by %s: user is not connected to WhatsApp", sender.JID)
@@ -3240,7 +3300,8 @@ func (portal *Portal) Cleanup(puppetsOnly bool) {
 	}
 }
 
-func (portal *Portal) HandleMatrixLeave(sender *User) {
+func (portal *Portal) HandleMatrixLeave(brSender bridge.User) {
+	sender := brSender.(*User)
 	if portal.IsPrivateChat() {
 		portal.log.Debugln("User left private chat portal, cleaning up and deleting...")
 		portal.Delete()
@@ -3257,7 +3318,9 @@ func (portal *Portal) HandleMatrixLeave(sender *User) {
 	portal.CleanupIfEmpty()
 }
 
-func (portal *Portal) HandleMatrixKick(sender *User, target *Puppet) {
+func (portal *Portal) HandleMatrixKick(brSender bridge.User, brTarget bridge.Ghost) {
+	sender := brSender.(*User)
+	target := brTarget.(*Puppet)
 	_, err := sender.Client.UpdateGroupParticipants(portal.Key.JID, map[types.JID]whatsmeow.ParticipantChange{
 		target.JID: whatsmeow.ParticipantChangeRemove,
 	})
@@ -3268,7 +3331,9 @@ func (portal *Portal) HandleMatrixKick(sender *User, target *Puppet) {
 	//portal.log.Infoln("Kick %s response: %s", puppet.JID, <-resp)
 }
 
-func (portal *Portal) HandleMatrixInvite(sender *User, target *Puppet) {
+func (portal *Portal) HandleMatrixInvite(brSender bridge.User, brTarget bridge.Ghost) {
+	sender := brSender.(*User)
+	target := brTarget.(*Puppet)
 	_, err := sender.Client.UpdateGroupParticipants(portal.Key.JID, map[types.JID]whatsmeow.ParticipantChange{
 		target.JID: whatsmeow.ParticipantChangeAdd,
 	})
@@ -3279,7 +3344,12 @@ func (portal *Portal) HandleMatrixInvite(sender *User, target *Puppet) {
 	//portal.log.Infofln("Add %s response: %s", puppet.JID, <-resp)
 }
 
-func (portal *Portal) HandleMatrixMeta(sender *User, evt *event.Event) {
+func (portal *Portal) HandleMatrixMeta(brSender bridge.User, evt *event.Event) {
+	sender := brSender.(*User)
+	if !sender.Whitelisted || !sender.IsLoggedIn() {
+		return
+	}
+
 	switch content := evt.Content.Parsed.(type) {
 	case *event.RoomNameEventContent:
 		if content.Name == portal.Name {

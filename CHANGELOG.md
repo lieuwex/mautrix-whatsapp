@@ -1,3 +1,9 @@
+# unreleased
+
+* Improved handling edge cases in backfill system.
+* Fixed chats not being marked as read when sending a message from another
+  WhatsApp client after receiving a call.
+
 # v0.4.0 (2022-05-16)
 
 * Switched from `/r0` to `/v3` paths everywhere.

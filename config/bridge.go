@@ -18,12 +18,12 @@ package config
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"text/template"
 
 	"go.mau.fi/whatsmeow/types"
 
+	"maunium.net/go/mautrix/bridge/bridgeconfig"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -111,30 +111,33 @@ type BridgeConfig struct {
 
 	CommandPrefix string `yaml:"command_prefix"`
 
-	ManagementRoomText struct {
-		Welcome            string `yaml:"welcome"`
-		WelcomeConnected   string `yaml:"welcome_connected"`
-		WelcomeUnconnected string `yaml:"welcome_unconnected"`
-		AdditionalHelp     string `yaml:"additional_help"`
-	} `yaml:"management_room_text"`
+	ManagementRoomText bridgeconfig.ManagementRoomTexts `yaml:"management_room_text"`
 
-	Encryption struct {
-		Allow   bool `yaml:"allow"`
-		Default bool `yaml:"default"`
+	Encryption bridgeconfig.EncryptionConfig `yaml:"encryption"`
 
-		KeySharing struct {
-			Allow               bool `yaml:"allow"`
-			RequireCrossSigning bool `yaml:"require_cross_signing"`
-			RequireVerification bool `yaml:"require_verification"`
-		} `yaml:"key_sharing"`
-	} `yaml:"encryption"`
+	Provisioning struct {
+		Prefix       string `yaml:"prefix"`
+		SharedSecret string `yaml:"shared_secret"`
+	} `yaml:"provisioning"`
 
-	Permissions PermissionConfig `yaml:"permissions"`
+	Permissions bridgeconfig.PermissionConfig `yaml:"permissions"`
 
 	Relay RelaybotConfig `yaml:"relay"`
 
-	usernameTemplate    *template.Template `yaml:"-"`
-	displaynameTemplate *template.Template `yaml:"-"`
+	ParsedUsernameTemplate *template.Template `yaml:"-"`
+	displaynameTemplate    *template.Template `yaml:"-"`
+}
+
+func (bc BridgeConfig) GetEncryptionConfig() bridgeconfig.EncryptionConfig {
+	return bc.Encryption
+}
+
+func (bc BridgeConfig) GetCommandPrefix() string {
+	return bc.CommandPrefix
+}
+
+func (bc BridgeConfig) GetManagementRoomTexts() bridgeconfig.ManagementRoomTexts {
+	return bc.ManagementRoomText
 }
 
 type umBridgeConfig BridgeConfig
@@ -145,7 +148,7 @@ func (bc *BridgeConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
-	bc.usernameTemplate, err = template.New("username").Parse(bc.UsernameTemplate)
+	bc.ParsedUsernameTemplate, err = template.New("username").Parse(bc.UsernameTemplate)
 	if err != nil {
 		return err
 	} else if !strings.Contains(bc.FormatUsername("1234567890"), "1234567890") {
@@ -206,101 +209,8 @@ func (bc BridgeConfig) FormatDisplayname(jid types.JID, contact types.ContactInf
 
 func (bc BridgeConfig) FormatUsername(username string) string {
 	var buf strings.Builder
-	_ = bc.usernameTemplate.Execute(&buf, username)
+	_ = bc.ParsedUsernameTemplate.Execute(&buf, username)
 	return buf.String()
-}
-
-type PermissionConfig map[string]PermissionLevel
-
-type PermissionLevel int
-
-const (
-	PermissionLevelDefault PermissionLevel = 0
-	PermissionLevelRelay   PermissionLevel = 5
-	PermissionLevelUser    PermissionLevel = 10
-	PermissionLevelAdmin   PermissionLevel = 100
-)
-
-func (pc *PermissionConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	rawPC := make(map[string]string)
-	err := unmarshal(&rawPC)
-	if err != nil {
-		return err
-	}
-
-	if *pc == nil {
-		*pc = make(map[string]PermissionLevel)
-	}
-	for key, value := range rawPC {
-		switch strings.ToLower(value) {
-		case "relaybot", "relay":
-			(*pc)[key] = PermissionLevelRelay
-		case "user":
-			(*pc)[key] = PermissionLevelUser
-		case "admin":
-			(*pc)[key] = PermissionLevelAdmin
-		default:
-			val, err := strconv.Atoi(value)
-			if err != nil {
-				(*pc)[key] = PermissionLevelDefault
-			} else {
-				(*pc)[key] = PermissionLevel(val)
-			}
-		}
-	}
-	return nil
-}
-
-func (pc *PermissionConfig) MarshalYAML() (interface{}, error) {
-	if *pc == nil {
-		return nil, nil
-	}
-	rawPC := make(map[string]string)
-	for key, value := range *pc {
-		switch value {
-		case PermissionLevelRelay:
-			rawPC[key] = "relay"
-		case PermissionLevelUser:
-			rawPC[key] = "user"
-		case PermissionLevelAdmin:
-			rawPC[key] = "admin"
-		default:
-			rawPC[key] = strconv.Itoa(int(value))
-		}
-	}
-	return rawPC, nil
-}
-
-func (pc PermissionConfig) IsRelayWhitelisted(userID id.UserID) bool {
-	return pc.GetPermissionLevel(userID) >= PermissionLevelRelay
-}
-
-func (pc PermissionConfig) IsWhitelisted(userID id.UserID) bool {
-	return pc.GetPermissionLevel(userID) >= PermissionLevelUser
-}
-
-func (pc PermissionConfig) IsAdmin(userID id.UserID) bool {
-	return pc.GetPermissionLevel(userID) >= PermissionLevelAdmin
-}
-
-func (pc PermissionConfig) GetPermissionLevel(userID id.UserID) PermissionLevel {
-	permissions, ok := pc[string(userID)]
-	if ok {
-		return permissions
-	}
-
-	_, homeserver, _ := userID.Parse()
-	permissions, ok = pc[homeserver]
-	if len(homeserver) > 0 && ok {
-		return permissions
-	}
-
-	permissions, ok = pc["*"]
-	if ok {
-		return permissions
-	}
-
-	return PermissionLevelDefault
 }
 
 type RelaybotConfig struct {

@@ -32,9 +32,11 @@ import (
 	"time"
 
 	log "maunium.net/go/maulogger/v2"
+	"maunium.net/go/mautrix/bridge/bridgeconfig"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
+	"maunium.net/go/mautrix/bridge"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
@@ -56,12 +58,13 @@ type User struct {
 	Client  *whatsmeow.Client
 	Session *store.Device
 
-	bridge *Bridge
+	bridge *WABridge
 	log    log.Logger
 
 	Admin            bool
 	Whitelisted      bool
 	RelayWhitelisted bool
+	PermissionLevel  bridgeconfig.PermissionLevel
 
 	mgmtCreateLock  sync.Mutex
 	spaceCreateLock sync.Mutex
@@ -84,38 +87,62 @@ type User struct {
 	BackfillQueue *BackfillQueue
 }
 
-func (bridge *Bridge) getUserByMXID(userID id.UserID, onlyIfExists bool) *User {
-	_, isPuppet := bridge.ParsePuppetMXID(userID)
-	if isPuppet || userID == bridge.Bot.UserID {
+func (br *WABridge) getUserByMXID(userID id.UserID, onlyIfExists bool) *User {
+	_, isPuppet := br.ParsePuppetMXID(userID)
+	if isPuppet || userID == br.Bot.UserID {
 		return nil
 	}
-	bridge.usersLock.Lock()
-	defer bridge.usersLock.Unlock()
-	user, ok := bridge.usersByMXID[userID]
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+	user, ok := br.usersByMXID[userID]
 	if !ok {
 		userIDPtr := &userID
 		if onlyIfExists {
 			userIDPtr = nil
 		}
-		return bridge.loadDBUser(bridge.DB.User.GetByMXID(userID), userIDPtr)
+		return br.loadDBUser(br.DB.User.GetByMXID(userID), userIDPtr)
 	}
 	return user
 }
 
-func (bridge *Bridge) GetUserByMXID(userID id.UserID) *User {
-	return bridge.getUserByMXID(userID, false)
+func (br *WABridge) GetUserByMXID(userID id.UserID) *User {
+	return br.getUserByMXID(userID, false)
 }
 
-func (bridge *Bridge) GetUserByMXIDIfExists(userID id.UserID) *User {
-	return bridge.getUserByMXID(userID, true)
+func (br *WABridge) GetIUser(userID id.UserID, create bool) bridge.User {
+	u := br.getUserByMXID(userID, !create)
+	if u == nil {
+		return nil
+	}
+	return u
 }
 
-func (bridge *Bridge) GetUserByJID(jid types.JID) *User {
-	bridge.usersLock.Lock()
-	defer bridge.usersLock.Unlock()
-	user, ok := bridge.usersByUsername[jid.User]
+func (user *User) GetPermissionLevel() bridgeconfig.PermissionLevel {
+	return user.PermissionLevel
+}
+
+func (user *User) GetManagementRoomID() id.RoomID {
+	return user.ManagementRoom
+}
+
+func (user *User) GetMXID() id.UserID {
+	return user.MXID
+}
+
+func (user *User) GetCommandState() map[string]interface{} {
+	return nil
+}
+
+func (br *WABridge) GetUserByMXIDIfExists(userID id.UserID) *User {
+	return br.getUserByMXID(userID, true)
+}
+
+func (br *WABridge) GetUserByJID(jid types.JID) *User {
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+	user, ok := br.usersByUsername[jid.User]
 	if !ok {
-		return bridge.loadDBUser(bridge.DB.User.GetByUsername(jid.User), nil)
+		return br.loadDBUser(br.DB.User.GetByUsername(jid.User), nil)
 	}
 	return user
 }
@@ -137,35 +164,35 @@ func (user *User) removeFromJIDMap(state BridgeState) {
 	user.sendBridgeState(state)
 }
 
-func (bridge *Bridge) GetAllUsers() []*User {
-	bridge.usersLock.Lock()
-	defer bridge.usersLock.Unlock()
-	dbUsers := bridge.DB.User.GetAll()
+func (br *WABridge) GetAllUsers() []*User {
+	br.usersLock.Lock()
+	defer br.usersLock.Unlock()
+	dbUsers := br.DB.User.GetAll()
 	output := make([]*User, len(dbUsers))
 	for index, dbUser := range dbUsers {
-		user, ok := bridge.usersByMXID[dbUser.MXID]
+		user, ok := br.usersByMXID[dbUser.MXID]
 		if !ok {
-			user = bridge.loadDBUser(dbUser, nil)
+			user = br.loadDBUser(dbUser, nil)
 		}
 		output[index] = user
 	}
 	return output
 }
 
-func (bridge *Bridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
+func (br *WABridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
 	if dbUser == nil {
 		if mxid == nil {
 			return nil
 		}
-		dbUser = bridge.DB.User.New()
+		dbUser = br.DB.User.New()
 		dbUser.MXID = *mxid
 		dbUser.Insert()
 	}
-	user := bridge.NewUser(dbUser)
-	bridge.usersByMXID[user.MXID] = user
+	user := br.NewUser(dbUser)
+	br.usersByMXID[user.MXID] = user
 	if !user.JID.IsEmpty() {
 		var err error
-		user.Session, err = bridge.WAContainer.GetDevice(user.JID)
+		user.Session, err = br.WAContainer.GetDevice(user.JID)
 		if err != nil {
 			user.log.Errorfln("Failed to load user's whatsapp session: %v", err)
 		} else if user.Session == nil {
@@ -174,27 +201,29 @@ func (bridge *Bridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
 			user.Update()
 		} else {
 			user.Session.Log = &waLogger{user.log.Sub("Session")}
-			bridge.usersByUsername[user.JID.User] = user
+			br.usersByUsername[user.JID.User] = user
 		}
 	}
 	if len(user.ManagementRoom) > 0 {
-		bridge.managementRooms[user.ManagementRoom] = user
+		br.managementRooms[user.ManagementRoom] = user
 	}
 	return user
 }
 
-func (bridge *Bridge) NewUser(dbUser *database.User) *User {
+func (br *WABridge) NewUser(dbUser *database.User) *User {
 	user := &User{
 		User:   dbUser,
-		bridge: bridge,
-		log:    bridge.Log.Sub("User").Sub(string(dbUser.MXID)),
+		bridge: br,
+		log:    br.Log.Sub("User").Sub(string(dbUser.MXID)),
 
 		historySyncs: make(chan *events.HistorySync, 32),
 		lastPresence: types.PresenceUnavailable,
 	}
-	user.RelayWhitelisted = user.bridge.Config.Bridge.Permissions.IsRelayWhitelisted(user.MXID)
-	user.Whitelisted = user.bridge.Config.Bridge.Permissions.IsWhitelisted(user.MXID)
-	user.Admin = user.bridge.Config.Bridge.Permissions.IsAdmin(user.MXID)
+
+	user.PermissionLevel = user.bridge.Config.Bridge.Permissions.Get(user.MXID)
+	user.RelayWhitelisted = user.PermissionLevel >= bridgeconfig.PermissionLevelRelay
+	user.Whitelisted = user.PermissionLevel >= bridgeconfig.PermissionLevelUser
+	user.Admin = user.PermissionLevel >= bridgeconfig.PermissionLevelAdmin
 	if len(user.bridge.Config.Homeserver.StatusEndpoint) > 0 {
 		user.bridgeStateQueue = make(chan BridgeState, 10)
 		go user.bridgeStateLoop()

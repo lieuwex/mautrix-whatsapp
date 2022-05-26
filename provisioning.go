@@ -43,15 +43,15 @@ import (
 )
 
 type ProvisioningAPI struct {
-	bridge *Bridge
+	bridge *WABridge
 	log    log.Logger
 }
 
 func (prov *ProvisioningAPI) Init() {
 	prov.log = prov.bridge.Log.Sub("Provisioning")
 
-	prov.log.Debugln("Enabling provisioning API at", prov.bridge.Config.AppService.Provisioning.Prefix)
-	r := prov.bridge.AS.Router.PathPrefix(prov.bridge.Config.AppService.Provisioning.Prefix).Subrouter()
+	prov.log.Debugln("Enabling provisioning API at", prov.bridge.Config.Bridge.Provisioning.Prefix)
+	r := prov.bridge.AS.Router.PathPrefix(prov.bridge.Config.Bridge.Provisioning.Prefix).Subrouter()
 	r.Use(prov.AuthMiddleware)
 	r.HandleFunc("/v1/ping", prov.Ping).Methods(http.MethodGet)
 	r.HandleFunc("/v1/login", prov.Login).Methods(http.MethodGet)
@@ -109,7 +109,7 @@ func (prov *ProvisioningAPI) AuthMiddleware(h http.Handler) http.Handler {
 		} else if strings.HasPrefix(auth, "Bearer ") {
 			auth = auth[len("Bearer "):]
 		}
-		if auth != prov.bridge.Config.AppService.Provisioning.SharedSecret {
+		if auth != prov.bridge.Config.Bridge.Provisioning.SharedSecret {
 			jsonResponse(w, http.StatusForbidden, map[string]interface{}{
 				"error":   "Invalid auth token",
 				"errcode": "M_FORBIDDEN",
@@ -290,7 +290,22 @@ func (prov *ProvisioningAPI) ListContacts(w http.ResponseWriter, r *http.Request
 			ErrCode: "failed to get contacts",
 		})
 	} else {
-		jsonResponse(w, http.StatusOK, contacts)
+		augmentedContacts := map[types.JID]interface{}{}
+		for jid, contact := range contacts {
+			var avatarUrl id.ContentURI
+			if puppet := prov.bridge.DB.Puppet.Get(jid); puppet != nil {
+				avatarUrl = puppet.AvatarURL
+			}
+			augmentedContacts[jid] = map[string]interface{}{
+				"Found":        contact.Found,
+				"FirstName":    contact.FirstName,
+				"FullName":     contact.FullName,
+				"PushName":     contact.PushName,
+				"BusinessName": contact.BusinessName,
+				"AvatarURL":    avatarUrl,
+			}
+		}
+		jsonResponse(w, http.StatusOK, augmentedContacts)
 	}
 }
 
@@ -604,6 +619,11 @@ func (prov *ProvisioningAPI) Login(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
+	if userTimezone := r.URL.Query().Get("tz"); userTimezone != "" {
+		user.Timezone = userTimezone
+		user.Update()
+	}
+
 	qrChan, err := user.Login(ctx)
 	if err != nil {
 		user.log.Errorln("Failed to log in from provisioning API:", err)
@@ -637,11 +657,6 @@ func (prov *ProvisioningAPI) Login(w http.ResponseWriter, r *http.Request) {
 					"phone":    fmt.Sprintf("+%s", jid.User),
 					"platform": user.Client.Store.Platform,
 				})
-
-				if userTimezone := r.URL.Query().Get("tz"); userTimezone != "" {
-					user.Timezone = userTimezone
-					user.Update()
-				}
 			case whatsmeow.QRChannelTimeout.Event:
 				user.log.Debugln("Login via provisioning API timed out")
 				errCode := "login timed out"
