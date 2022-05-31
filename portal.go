@@ -40,13 +40,13 @@ import (
 	"golang.org/x/image/draw"
 	"golang.org/x/image/webp"
 	"google.golang.org/protobuf/proto"
-	"maunium.net/go/mautrix/bridge/bridgeconfig"
 
 	log "maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/bridge"
+	"maunium.net/go/mautrix/bridge/bridgeconfig"
 	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
@@ -1379,10 +1379,11 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 		return err
 	}
 	portal.MXID = resp.RoomID
-	portal.Update(nil)
 	portal.bridge.portalsLock.Lock()
 	portal.bridge.portalsByMXID[portal.MXID] = portal
 	portal.bridge.portalsLock.Unlock()
+	portal.Update(nil)
+	portal.log.Infoln("Matrix room created:", portal.MXID)
 
 	// We set the memberships beforehand to make sure the encryption key exchange in initial backfill knows the users are here.
 	for _, userID := range invite {
@@ -1503,10 +1504,7 @@ func (portal *Portal) SetReply(content *event.MessageEventContent, replyToID typ
 	evt, err := portal.MainIntent().GetEvent(portal.MXID, message.MXID)
 	if err != nil {
 		portal.log.Warnln("Failed to get reply target:", err)
-		content.RelatesTo = &event.RelatesTo{
-			EventID: message.MXID,
-			Type:    event.RelReply,
-		}
+		content.RelatesTo = (&event.RelatesTo{}).SetReplyTo(message.MXID)
 		return true
 	}
 	_ = evt.Content.ParseRaw(evt.Type)
@@ -2915,16 +2913,14 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 	if err != nil {
 		portal.log.Errorfln("Error sending message: %v", err)
 		portal.sendErrorMessage(err.Error(), true)
-		status := appservice.StatusPermFailure
+		status := bridge.MsgStatusPermFailure
 		if errors.Is(err, whatsmeow.ErrBroadcastListUnsupported) {
-			status = appservice.StatusUnsupported
+			status = bridge.MsgStatusUnsupported
 		}
-		checkpoint := appservice.NewMessageSendCheckpoint(evt, appservice.StepRemote, status, 0)
-		checkpoint.Info = err.Error()
-		go checkpoint.Send(portal.bridge.AS)
+		portal.bridge.SendMessageCheckpoint(evt, bridge.MsgStepRemote, err, status, 0)
 	} else {
 		portal.log.Debugfln("Handled Matrix event %s", evt.ID)
-		portal.bridge.AS.SendMessageSendCheckpoint(evt, appservice.StepRemote, 0)
+		portal.bridge.SendMessageSuccessCheckpoint(evt, bridge.MsgStepRemote, 0)
 		portal.sendDeliveryReceipt(evt.ID)
 		dbMsg.MarkSent(ts)
 	}
@@ -2950,10 +2946,10 @@ func (portal *Portal) HandleMatrixReaction(sender *User, evt *event.Event) {
 	err := portal.handleMatrixReaction(sender, evt)
 	if err != nil {
 		portal.log.Errorfln("Error sending reaction %s: %v", evt.ID, err)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, err, true, 0)
+		portal.bridge.SendMessageErrorCheckpoint(evt, bridge.MsgStepRemote, err, true, 0)
 	} else {
 		portal.log.Debugfln("Handled Matrix reaction %s", evt.ID)
-		portal.bridge.AS.SendMessageSendCheckpoint(evt, appservice.StepRemote, 0)
+		portal.bridge.SendMessageSuccessCheckpoint(evt, bridge.MsgStepRemote, 0)
 		portal.sendDeliveryReceipt(evt.ID)
 	}
 }
@@ -3042,15 +3038,15 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	msg := portal.bridge.DB.Message.GetByMXID(evt.Redacts)
 	if msg == nil {
 		portal.log.Debugfln("Ignoring redaction %s of unknown event by %s", evt.ID, senderLogIdentifier)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target not found"), true, 0)
+		portal.bridge.SendMessageErrorCheckpoint(evt, bridge.MsgStepRemote, errors.New("target not found"), true, 0)
 		return
 	} else if msg.IsFakeJID() {
 		portal.log.Debugfln("Ignoring redaction %s of fake event by %s", evt.ID, senderLogIdentifier)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("target is a fake event"), true, 0)
+		portal.bridge.SendMessageErrorCheckpoint(evt, bridge.MsgStepRemote, errors.New("target is a fake event"), true, 0)
 		return
 	} else if msg.Sender.User != sender.JID.User {
 		portal.log.Debugfln("Ignoring redaction %s of %s/%s by %s: message was sent by someone else (%s, not %s)", evt.ID, msg.MXID, msg.JID, senderLogIdentifier, msg.Sender, sender.JID)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("message was sent by someone else"), true, 0)
+		portal.bridge.SendMessageErrorCheckpoint(evt, bridge.MsgStepRemote, errors.New("message was sent by someone else"), true, 0)
 		return
 	}
 
@@ -3058,11 +3054,11 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	if msg.Type == database.MsgReaction {
 		if reaction := portal.bridge.DB.Reaction.GetByMXID(evt.Redacts); reaction == nil {
 			portal.log.Debugfln("Ignoring redaction of reaction %s: reaction database entry not found", evt.ID)
-			portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("reaction database entry not found"), true, 0)
+			portal.bridge.SendMessageErrorCheckpoint(evt, bridge.MsgStepRemote, errors.New("reaction database entry not found"), true, 0)
 			return
 		} else if reactionTarget := reaction.GetTarget(); reactionTarget == nil {
 			portal.log.Debugfln("Ignoring redaction of reaction %s: reaction target message not found", evt.ID)
-			portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, errors.New("reaction target message not found"), true, 0)
+			portal.bridge.SendMessageErrorCheckpoint(evt, bridge.MsgStepRemote, errors.New("reaction target message not found"), true, 0)
 			return
 		} else {
 			portal.log.Debugfln("Sending redaction reaction %s of %s/%s to WhatsApp", evt.ID, msg.MXID, msg.JID)
@@ -3074,10 +3070,10 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 	}
 	if err != nil {
 		portal.log.Errorfln("Error handling Matrix redaction %s: %v", evt.ID, err)
-		portal.bridge.AS.SendErrorMessageSendCheckpoint(evt, appservice.StepRemote, err, true, 0)
+		portal.bridge.SendMessageErrorCheckpoint(evt, bridge.MsgStepRemote, err, true, 0)
 	} else {
 		portal.log.Debugfln("Handled Matrix redaction %s of %s", evt.ID, evt.Redacts)
-		portal.bridge.AS.SendMessageSendCheckpoint(evt, appservice.StepRemote, 0)
+		portal.bridge.SendMessageSuccessCheckpoint(evt, bridge.MsgStepRemote, 0)
 		portal.sendDeliveryReceipt(evt.ID)
 	}
 }
