@@ -93,7 +93,7 @@ func (br *WABridge) Init() {
 	}
 
 	br.DB = database.New(br.Bridge.DB)
-	br.WAContainer = sqlstore.NewWithDB(br.DB.DB, br.DB.Dialect.String(), nil)
+	br.WAContainer = sqlstore.NewWithDB(br.DB.DB, br.DB.Dialect.String(), &waLogger{br.DB.Log.Sub("WhatsApp")})
 	br.WAContainer.DatabaseErrorHandler = br.DB.HandleSignalStoreError
 
 	ss := br.Config.Bridge.Provisioning.SharedSecret
@@ -270,6 +270,8 @@ func main() {
 		Description:  "A Matrix-WhatsApp puppeting bridge.",
 		Version:      "0.4.0",
 		ProtocolName: "WhatsApp",
+
+		CryptoPickleKey: "maunium.net/go/mautrix-whatsapp",
 
 		ConfigUpgrader: &configupgrade.StructUpgrader{
 			SimpleUpgrader: configupgrade.SimpleUpgrader(config.DoUpgrade),
