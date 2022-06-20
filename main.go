@@ -118,9 +118,9 @@ func (br *WABridge) Init() {
 		store.DeviceProps.Version.Secondary = proto.Uint32(uint32(secondary))
 		store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(tertiary))
 	}
-	platformID, ok := waProto.CompanionProps_CompanionPropsPlatformType_value[strings.ToUpper(br.Config.WhatsApp.BrowserName)]
+	platformID, ok := waProto.DeviceProps_DevicePropsPlatformType_value[strings.ToUpper(br.Config.WhatsApp.BrowserName)]
 	if ok {
-		store.DeviceProps.PlatformType = waProto.CompanionProps_CompanionPropsPlatformType(platformID).Enum()
+		store.DeviceProps.PlatformType = waProto.DeviceProps_DevicePropsPlatformType(platformID).Enum()
 	}
 }
 
@@ -268,7 +268,7 @@ func main() {
 		Name:         "mautrix-whatsapp",
 		URL:          "https://github.com/mautrix/whatsapp",
 		Description:  "A Matrix-WhatsApp puppeting bridge.",
-		Version:      "0.4.0",
+		Version:      "0.5.0",
 		ProtocolName: "WhatsApp",
 
 		CryptoPickleKey: "maunium.net/go/mautrix-whatsapp",
