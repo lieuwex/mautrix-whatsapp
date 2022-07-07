@@ -363,7 +363,7 @@ func fnCreate(ce *WrappedCommandEvent) {
 	}
 
 	ce.Log.Infofln("Creating group for %s with name %s and participants %+v", ce.RoomID, roomNameEvent.Name, participants)
-	resp, err := ce.User.Client.CreateGroup(roomNameEvent.Name, participants)
+	resp, err := ce.User.Client.CreateGroup(roomNameEvent.Name, participants, "")
 	if err != nil {
 		ce.Reply("Failed to create group: %v", err)
 		return
@@ -379,7 +379,7 @@ func fnCreate(ce *WrappedCommandEvent) {
 	portal.Name = roomNameEvent.Name
 	portal.Encrypted = encryptionEvent.Algorithm == id.AlgorithmMegolmV1
 	if !portal.Encrypted && ce.Bridge.Config.Bridge.Encryption.Default {
-		_, err = portal.MainIntent().SendStateEvent(portal.MXID, event.StateEncryption, "", &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1})
+		_, err = portal.MainIntent().SendStateEvent(portal.MXID, event.StateEncryption, "", portal.GetEncryptionEventContent())
 		if err != nil {
 			portal.log.Warnln("Failed to enable encryption in room:", err)
 			if errors.Is(err, mautrix.MForbidden) {
@@ -1069,7 +1069,7 @@ var cmdSync = &commands.FullHandler{
 
 func fnSync(ce *WrappedCommandEvent) {
 	if len(ce.Args) == 0 {
-		ce.Reply("**Usage:** `sync <appstate/contacts/groups/space> [--create-portals]`")
+		ce.Reply("**Usage:** `sync <appstate/contacts/avatars/groups/space> [--contact-avatars] [--create-portals]`")
 		return
 	}
 	args := strings.ToLower(strings.Join(ce.Args, " "))
@@ -1078,6 +1078,11 @@ func fnSync(ce *WrappedCommandEvent) {
 	space := strings.Contains(args, "space")
 	groups := strings.Contains(args, "groups") || space
 	createPortals := strings.Contains(args, "--create-portals")
+	contactAvatars := strings.Contains(args, "--contact-avatars")
+	if contactAvatars && (!contacts || appState) {
+		ce.Reply("`--contact-avatars` can only be used with `sync contacts`")
+		return
+	}
 
 	if appState {
 		for _, name := range appstate.AllPatchNames {
@@ -1094,7 +1099,7 @@ func fnSync(ce *WrappedCommandEvent) {
 			}
 		}
 	} else if contacts {
-		err := ce.User.ResyncContacts()
+		err := ce.User.ResyncContacts(contactAvatars)
 		if err != nil {
 			ce.Reply("Error resyncing contacts: %v", err)
 		} else {
@@ -1138,10 +1143,15 @@ var cmdDisappearingTimer = &commands.FullHandler{
 		Description: "Set future messages in the room to disappear after the given time.",
 		Args:        "<off/1d/7d/90d>",
 	},
-	RequiresLogin: true,
+	RequiresLogin:  true,
+	RequiresPortal: true,
 }
 
 func fnDisappearingTimer(ce *WrappedCommandEvent) {
+	if len(ce.Args) == 0 {
+		ce.Reply("**Usage:** `disappearing-timer <off/1d/7d/90d>`")
+		return
+	}
 	duration, ok := whatsmeow.ParseDisappearingTimerString(ce.Args[0])
 	if !ok {
 		ce.Reply("Invalid timer '%s'", ce.Args[0])
