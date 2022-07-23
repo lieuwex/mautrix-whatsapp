@@ -264,7 +264,7 @@ func (user *User) EnqueuePuppetResync(puppet *Puppet) {
 }
 
 func (user *User) EnqueuePortalResync(portal *Portal) {
-	if portal.IsPrivateChat() || portal.LastSync.Add(resyncMinInterval).After(time.Now()) {
+	if !portal.IsGroupChat() || portal.LastSync.Add(resyncMinInterval).After(time.Now()) {
 		return
 	}
 	user.resyncQueueLock.Lock()
@@ -673,7 +673,7 @@ func (user *User) sendHackyPhonePing() {
 	} else {
 		user.log.Warnfln("Failed to get last app state key ID to send hacky phone ping: %v - sending empty request", err)
 	}
-	ts, err := user.Client.SendMessage(context.Background(), user.JID.ToNonAD(), msgID, &waProto.Message{
+	resp, err := user.Client.SendMessage(context.Background(), user.JID.ToNonAD(), msgID, &waProto.Message{
 		ProtocolMessage: &waProto.ProtocolMessage{
 			Type: waProto.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST.Enum(),
 			AppStateSyncKeyRequest: &waProto.AppStateSyncKeyRequest{
@@ -684,8 +684,8 @@ func (user *User) sendHackyPhonePing() {
 	if err != nil {
 		user.log.Warnfln("Failed to send hacky phone ping: %v", err)
 	} else {
-		user.log.Debugfln("Sent hacky phone ping %s/%s because phone has been offline for >10 days", msgID, ts.Unix())
-		user.PhoneLastPinged = ts
+		user.log.Debugfln("Sent hacky phone ping %s/%s because phone has been offline for >10 days", msgID, resp.Timestamp.Unix())
+		user.PhoneLastPinged = resp.Timestamp
 		user.Update()
 	}
 }
@@ -920,6 +920,16 @@ func (user *User) HandleEvent(event interface{}) {
 	case *events.MarkChatAsRead:
 		if user.bridge.Config.Bridge.SyncManualMarkedUnread {
 			user.markUnread(user.GetPortalByJID(v.JID), !v.Action.GetRead())
+		}
+	case *events.DeleteForMe:
+		portal := user.GetPortalByJID(v.ChatJID)
+		if portal != nil {
+			portal.deleteForMe(user, v)
+		}
+	case *events.DeleteChat:
+		portal := user.GetPortalByJID(v.JID)
+		if portal != nil {
+			portal.HandleWhatsAppDeleteChat(user)
 		}
 	default:
 		user.log.Debugfln("Unknown type of event in HandleEvent: %T", v)
@@ -1187,7 +1197,7 @@ func (user *User) handleChatPresence(presence *events.ChatPresence) {
 			}
 			_, _ = puppet.IntentFor(portal).UserTyping(puppet.typingIn, false, 0)
 		}
-		_, _ = puppet.IntentFor(portal).UserTyping(portal.MXID, true, WATypingTimeout.Milliseconds())
+		_, _ = puppet.IntentFor(portal).UserTyping(portal.MXID, true, WATypingTimeout)
 		puppet.typingIn = portal.MXID
 		puppet.typingAt = time.Now()
 	} else {

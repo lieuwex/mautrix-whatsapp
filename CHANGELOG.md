@@ -1,4 +1,4 @@
-# v0.6.0 (unreleased)
+# v0.6.0 (2022-07-16)
 
 * Started requiring homeservers to advertise Matrix v1.1 support.
   * This bumps up the minimum homeserver versions to Synapse 1.54 and
@@ -18,12 +18,17 @@
 * Added config validation to make the bridge refuse to start if critical fields
   like homeserver or database address haven't been changed from the defaults.
 * Added option to include captions in the same message as the media to
-  implement [MSC2530].
+  implement [MSC2530]. Sending captions the same way is also supported and
+  enabled by default.
 * Added basic support for fancy business messages (template and list messages).
 * Added periodic background sync of user and group avatars.
 * Added maximum message handling duration config options to prevent messages
   getting stuck and blocking everything.
 * Changed message send error notices to be replies to the errored message.
+* Changed dimensions of stickers bridged from WhatsApp to match WhatsApp web.
+* Changed attachment bridging to find the Matrix `msgtype` based on the
+  WhatsApp message type instead of the file mimetype.
+* Updated Docker image to Alpine 3.16.
 * Fixed backfill queue on SQLite.
 
 [MSC2530]: https://github.com/matrix-org/matrix-spec-proposals/pull/2530

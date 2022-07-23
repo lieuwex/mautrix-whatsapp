@@ -100,7 +100,7 @@ func (portal *Portal) MarkEncrypted() {
 
 func (portal *Portal) ReceiveMatrixEvent(user bridge.User, evt *event.Event) {
 	if user.GetPermissionLevel() >= bridgeconfig.PermissionLevelUser || portal.HasRelaybot() {
-		portal.matrixMessages <- PortalMatrixMessage{user: user.(*User), evt: evt}
+		portal.matrixMessages <- PortalMatrixMessage{user: user.(*User), evt: evt, receivedAt: time.Now()}
 	}
 }
 
@@ -216,8 +216,9 @@ type PortalMessage struct {
 }
 
 type PortalMatrixMessage struct {
-	evt  *event.Event
-	user *User
+	evt        *event.Event
+	user       *User
+	receivedAt time.Time
 }
 
 type PortalMediaRetry struct {
@@ -290,10 +291,19 @@ func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
 }
 
 func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
-	portal.handleMatrixReadReceipt(msg.user, "", time.UnixMilli(msg.evt.Timestamp), false)
+	evtTS := time.UnixMilli(msg.evt.Timestamp)
+	timings := messageTimings{
+		initReceive:  msg.evt.Mautrix.ReceivedAt.Sub(evtTS),
+		decrypt:      msg.evt.Mautrix.DecryptionDuration,
+		portalQueue:  time.Since(msg.receivedAt),
+		totalReceive: time.Since(evtTS),
+	}
+	implicitRRStart := time.Now()
+	portal.handleMatrixReadReceipt(msg.user, "", evtTS, false)
+	timings.implicitRR = time.Since(implicitRRStart)
 	switch msg.evt.Type {
 	case event.EventMessage, event.EventSticker:
-		portal.HandleMatrixMessage(msg.user, msg.evt)
+		portal.HandleMatrixMessage(msg.user, msg.evt, timings)
 	case event.EventRedaction:
 		portal.HandleMatrixRedaction(msg.user, msg.evt)
 	case event.EventReaction:
@@ -1121,13 +1131,6 @@ func (portal *Portal) UpdateMetadata(user *User, groupInfo *types.GroupInfo) boo
 	return update
 }
 
-func (portal *Portal) ensureMXIDInvited(mxid id.UserID) {
-	err := portal.MainIntent().EnsureInvited(portal.MXID, mxid)
-	if err != nil {
-		portal.log.Warnfln("Failed to ensure %s is invited to %s: %v", mxid, portal.MXID, err)
-	}
-}
-
 func (portal *Portal) ensureUserInvited(user *User) bool {
 	return user.ensureInvited(portal.MainIntent(), portal.MXID, portal.IsPrivateChat())
 }
@@ -1663,6 +1666,28 @@ func (portal *Portal) HandleMessageRevoke(user *User, info *types.MessageInfo, k
 	return true
 }
 
+func (portal *Portal) deleteForMe(user *User, content *events.DeleteForMe) bool {
+	matrixUsers, err := portal.GetMatrixUsers()
+	if err != nil {
+		portal.log.Errorln("Failed to get Matrix users in portal to see if DeleteForMe should be handled:", err)
+		return false
+	}
+	if len(matrixUsers) == 1 && matrixUsers[0] == user.MXID {
+		msg := portal.bridge.DB.Message.GetByJID(portal.Key, content.MessageID)
+		if msg == nil || msg.IsFakeMXID() {
+			return false
+		}
+		_, err := portal.MainIntent().RedactEvent(portal.MXID, msg.MXID)
+		if err != nil {
+			portal.log.Errorln("Failed to redact %s: %v", msg.JID, err)
+		} else {
+			msg.Delete()
+		}
+		return true
+	}
+	return false
+}
+
 func (portal *Portal) sendMainIntentMessage(content *event.MessageEventContent) (*mautrix.RespSendEvent, error) {
 	return portal.sendMessage(portal.MainIntent(), event.EventMessage, content, nil, 0)
 }
@@ -2126,6 +2151,7 @@ func (portal *Portal) removeUser(isSameUser bool, kicker *appservice.IntentAPI, 
 			_, _ = portal.MainIntent().KickUser(portal.MXID, &mautrix.ReqKickUser{UserID: target})
 		}
 	}
+	portal.CleanupIfEmpty()
 }
 
 func (portal *Portal) HandleWhatsAppKick(source *User, senderJID types.JID, jids []types.JID) {
@@ -2178,6 +2204,22 @@ func (portal *Portal) HandleWhatsAppInvite(source *User, senderJID *types.JID, j
 		}
 	}
 	return
+}
+
+func (portal *Portal) HandleWhatsAppDeleteChat(user *User) {
+	matrixUsers, err := portal.GetMatrixUsers()
+	if err != nil {
+		portal.log.Errorln("Failed to get Matrix users to see if DeleteChat should be handled:", err)
+		return
+	}
+	if len(matrixUsers) > 1 {
+		portal.log.Infoln("Portal contains more than one Matrix user, so deleteChat will not be handled.")
+		return
+	} else if (len(matrixUsers) == 1 && matrixUsers[0] == user.MXID) || len(matrixUsers) < 1 {
+		portal.log.Debugln("User deleted chat and there are no other Matrix users using it, deleting portal...")
+		portal.Delete()
+		portal.Cleanup(false)
+	}
 }
 
 const failedMediaField = "fi.mau.whatsapp.failed_media"
@@ -2771,9 +2813,16 @@ func (portal *Portal) convertWebPtoPNG(webpImage []byte) ([]byte, error) {
 }
 
 func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, relaybotFormatted bool, content *event.MessageEventContent, eventID id.EventID, mediaType whatsmeow.MediaType) (*MediaUpload, error) {
+	fileName := content.Body
 	var caption string
 	var mentionedJIDs []string
-	if relaybotFormatted {
+	var hasHTMLCaption bool
+	if content.FileName != "" && content.Body != content.FileName {
+		fileName = content.FileName
+		caption = content.Body
+		hasHTMLCaption = content.Format == event.FormatHTML
+	}
+	if relaybotFormatted || hasHTMLCaption {
 		caption, mentionedJIDs = portal.bridge.Formatter.ParseMatrix(content.FormattedBody)
 	}
 
@@ -2831,6 +2880,7 @@ func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, r
 
 	return &MediaUpload{
 		UploadResponse: uploadResp,
+		FileName:       fileName,
 		Caption:        caption,
 		MentionedJIDs:  mentionedJIDs,
 		Thumbnail:      thumbnail,
@@ -2841,6 +2891,7 @@ func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, r
 type MediaUpload struct {
 	whatsmeow.UploadResponse
 	Caption       string
+	FileName      string
 	MentionedJIDs []string
 	Thumbnail     []byte
 	FileLength    int
@@ -3046,10 +3097,11 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		}
 		msg.DocumentMessage = &waProto.DocumentMessage{
 			ContextInfo:   &ctxInfo,
+			Caption:       &media.Caption,
 			JpegThumbnail: media.Thumbnail,
 			Url:           &media.URL,
-			Title:         &content.Body,
-			FileName:      &content.Body,
+			Title:         &media.FileName,
+			FileName:      &media.FileName,
 			MediaKey:      media.MediaKey,
 			Mimetype:      &content.GetInfo().MimeType,
 			FileEncSha256: media.FileEncSHA256,
@@ -3086,18 +3138,19 @@ func (portal *Portal) generateMessageInfo(sender *User) *types.MessageInfo {
 	}
 }
 
-func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
+func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timings messageTimings) {
+	start := time.Now()
+	ms := metricSender{portal: portal, timings: &timings}
+
 	if err := portal.canBridgeFrom(sender, true); err != nil {
-		go portal.sendMessageMetrics(evt, err, "Ignoring", nil)
+		go ms.sendMessageMetrics(evt, err, "Ignoring", true)
 		return
 	} else if portal.Key.JID == types.StatusBroadcastJID && portal.bridge.Config.Bridge.DisableStatusBroadcastSend {
-		go portal.sendMessageMetrics(evt, errBroadcastSendDisabled, "Ignoring", nil)
+		go ms.sendMessageMetrics(evt, errBroadcastSendDisabled, "Ignoring", true)
 		return
 	}
 
-	messageAge := time.Since(time.UnixMilli(evt.Timestamp))
-	ms := metricSender{portal: portal}
-
+	messageAge := timings.totalReceive
 	origEvtID := evt.ID
 	var dbMsg *database.Message
 	if retryMeta := evt.Content.AsMessage().MessageSendRetry; retryMeta != nil {
@@ -3116,13 +3169,22 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 		portal.log.Debugfln("Received message %s from %s (age: %s)", evt.ID, evt.Sender, messageAge)
 	}
 
-	if portal.bridge.Config.Bridge.MessageHandlingTimeout.ErrorAfter > 0 {
-		remainingTime := portal.bridge.Config.Bridge.MessageHandlingTimeout.ErrorAfter - messageAge
+	errorAfter := portal.bridge.Config.Bridge.MessageHandlingTimeout.ErrorAfter
+	deadline := portal.bridge.Config.Bridge.MessageHandlingTimeout.Deadline
+	isScheduled, _ := evt.Content.Raw["com.beeper.scheduled"].(bool)
+	if isScheduled {
+		portal.log.Debugfln("%s is a scheduled message, extending handling timeouts", evt.ID)
+		errorAfter *= 10
+		deadline *= 10
+	}
+
+	if errorAfter > 0 {
+		remainingTime := errorAfter - messageAge
 		if remainingTime < 0 {
 			go ms.sendMessageMetrics(evt, errTimeoutBeforeHandling, "Timeout handling", true)
 			return
 		} else if remainingTime < 1*time.Second {
-			portal.log.Warnfln("Message %s was delayed before reaching the bridge, only have %s (of %s timeout) until delay warning", evt.ID, remainingTime, portal.bridge.Config.Bridge.MessageHandlingTimeout.ErrorAfter)
+			portal.log.Warnfln("Message %s was delayed before reaching the bridge, only have %s (of %s timeout) until delay warning", evt.ID, remainingTime, errorAfter)
 		}
 		go func() {
 			time.Sleep(remainingTime)
@@ -3131,13 +3193,16 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 	}
 
 	ctx := context.Background()
-	if portal.bridge.Config.Bridge.MessageHandlingTimeout.Deadline > 0 {
+	if deadline > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, portal.bridge.Config.Bridge.MessageHandlingTimeout.Deadline)
+		ctx, cancel = context.WithTimeout(ctx, deadline)
 		defer cancel()
 	}
 
+	timings.preproc = time.Since(start)
+	start = time.Now()
 	msg, sender, err := portal.convertMatrixMessage(ctx, sender, evt)
+	timings.convert = time.Since(start)
 	if msg == nil {
 		go ms.sendMessageMetrics(evt, err, "Error converting", true)
 		return
@@ -3150,10 +3215,13 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event) {
 		info.ID = dbMsg.JID
 	}
 	portal.log.Debugln("Sending event", evt.ID, "to WhatsApp", info.ID)
-	ts, err := sender.Client.SendMessage(ctx, portal.Key.JID, info.ID, msg)
+	start = time.Now()
+	resp, err := sender.Client.SendMessage(ctx, portal.Key.JID, info.ID, msg)
+	timings.totalSend = time.Since(start)
+	timings.whatsmeow = resp.DebugTimings
 	go ms.sendMessageMetrics(evt, err, "Error sending", true)
 	if err == nil {
-		dbMsg.MarkSent(ts)
+		dbMsg.MarkSent(resp.Timestamp)
 	}
 }
 
@@ -3197,14 +3265,14 @@ func (portal *Portal) handleMatrixReaction(sender *User, evt *event.Event) error
 	dbMsg := portal.markHandled(nil, nil, info, evt.ID, false, true, database.MsgReaction, database.MsgNoError)
 	portal.upsertReaction(nil, target.JID, sender.JID, evt.ID, info.ID)
 	portal.log.Debugln("Sending reaction", evt.ID, "to WhatsApp", info.ID)
-	ts, err := portal.sendReactionToWhatsApp(sender, info.ID, target, content.RelatesTo.Key, evt.Timestamp)
+	resp, err := portal.sendReactionToWhatsApp(sender, info.ID, target, content.RelatesTo.Key, evt.Timestamp)
 	if err == nil {
-		dbMsg.MarkSent(ts)
+		dbMsg.MarkSent(resp.Timestamp)
 	}
 	return err
 }
 
-func (portal *Portal) sendReactionToWhatsApp(sender *User, id types.MessageID, target *database.Message, key string, timestamp int64) (time.Time, error) {
+func (portal *Portal) sendReactionToWhatsApp(sender *User, id types.MessageID, target *database.Message, key string, timestamp int64) (whatsmeow.SendResponse, error) {
 	var messageKeyParticipant *string
 	if !portal.IsPrivateChat() {
 		messageKeyParticipant = proto.String(target.Sender.ToNonAD().String())
@@ -3296,7 +3364,7 @@ func (portal *Portal) HandleMatrixReadReceipt(sender bridge.User, eventID id.Eve
 func (portal *Portal) handleMatrixReadReceipt(sender *User, eventID id.EventID, receiptTimestamp time.Time, isExplicit bool) {
 	if !sender.IsLoggedIn() {
 		if isExplicit {
-			portal.log.Debugfln("Ignoring read receipt by %s: user is not connected to WhatsApp", sender.JID)
+			portal.log.Debugfln("Ignoring read receipt by %s/%s: user is not connected to WhatsApp", sender.MXID, sender.JID)
 		}
 		return
 	}
@@ -3461,13 +3529,6 @@ func (portal *Portal) CleanupIfEmpty() {
 
 func (portal *Portal) Cleanup(puppetsOnly bool) {
 	if len(portal.MXID) == 0 {
-		return
-	}
-	if portal.IsPrivateChat() {
-		_, err := portal.MainIntent().LeaveRoom(portal.MXID)
-		if err != nil {
-			portal.log.Warnln("Failed to leave private chat portal with main intent:", err)
-		}
 		return
 	}
 	intent := portal.MainIntent()

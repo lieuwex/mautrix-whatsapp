@@ -21,9 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
+
+	log "maunium.net/go/maulogger/v2"
 
 	"go.mau.fi/whatsmeow"
-	log "maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridge"
@@ -59,7 +61,7 @@ var (
 	errTimeoutBeforeHandling = errors.New("message timed out before handling was started")
 )
 
-func errorToStatusReason(err error) (reason event.MessageStatusReason, isCertain, canRetry, sendNotice bool) {
+func errorToStatusReason(err error) (reason event.MessageStatusReason, status event.MessageStatus, isCertain, sendNotice bool, humanMessage string) {
 	switch {
 	case errors.Is(err, whatsmeow.ErrBroadcastListUnsupported),
 		errors.Is(err, errUnexpectedParsedContentType),
@@ -69,28 +71,30 @@ func errorToStatusReason(err error) (reason event.MessageStatusReason, isCertain
 		errors.Is(err, whatsmeow.ErrRecipientADJID),
 		errors.Is(err, errBroadcastReactionNotSupported),
 		errors.Is(err, errBroadcastSendDisabled):
-		return event.MessageStatusUnsupported, true, false, true
+		return event.MessageStatusUnsupported, event.MessageStatusFail, true, true, ""
 	case errors.Is(err, errTimeoutBeforeHandling):
-		return event.MessageStatusTooOld, true, true, true
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, errMessageTakingLong):
-		return event.MessageStatusTooOld, false, true, true
+		return event.MessageStatusTooOld, event.MessageStatusRetriable, true, true, "the message was too old when it reached the bridge, so it was not handled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return event.MessageStatusTooOld, event.MessageStatusRetriable, false, true, "handling the message took too long and was cancelled"
+	case errors.Is(err, errMessageTakingLong):
+		return event.MessageStatusTooOld, event.MessageStatusPending, false, true, err.Error()
 	case errors.Is(err, errTargetNotFound),
 		errors.Is(err, errTargetIsFake),
 		errors.Is(err, errReactionDatabaseNotFound),
 		errors.Is(err, errReactionTargetNotFound),
 		errors.Is(err, errTargetSentBySomeoneElse):
-		return event.MessageStatusGenericError, true, false, false
+		return event.MessageStatusGenericError, event.MessageStatusFail, true, false, ""
 	case errors.Is(err, whatsmeow.ErrNotConnected),
 		errors.Is(err, errUserNotConnected):
-		return event.MessageStatusGenericError, true, true, true
+		return event.MessageStatusGenericError, event.MessageStatusRetriable, true, true, ""
 	case errors.Is(err, errUserNotLoggedIn),
 		errors.Is(err, errDifferentUser):
-		return event.MessageStatusGenericError, true, true, false
+		return event.MessageStatusGenericError, event.MessageStatusRetriable, true, false, ""
 	case errors.Is(err, errMessageDisconnected),
 		errors.Is(err, errMessageRetryDisconnected):
-		return event.MessageStatusGenericError, false, true, true
+		return event.MessageStatusGenericError, event.MessageStatusRetriable, false, true, ""
 	default:
-		return event.MessageStatusGenericError, false, true, true
+		return event.MessageStatusGenericError, event.MessageStatusRetriable, false, true, ""
 	}
 }
 
@@ -141,17 +145,15 @@ func (portal *Portal) sendStatusEvent(evtID, lastRetry id.EventID, err error) {
 			Type:    event.RelReference,
 			EventID: evtID,
 		},
-		Success:   err == nil,
 		LastRetry: lastRetry,
 	}
-	if !content.Success {
-		reason, isCertain, canRetry, _ := errorToStatusReason(err)
-		content.Reason = reason
-		content.IsCertain = &isCertain
-		content.CanRetry = &canRetry
-		content.StillWorking = errors.Is(err, errMessageTakingLong)
+	if err == nil {
+		content.Status = event.MessageStatusSuccess
+	} else {
+		content.Reason, content.Status, _, _, content.Message = errorToStatusReason(err)
 		content.Error = err.Error()
 	}
+	content.FillLegacyBooleans()
 	_, err = intent.SendMessageEvent(portal.MXID, event.BeeperMessageStatus, &content)
 	if err != nil {
 		portal.log.Warnln("Failed to send message status event:", err)
@@ -193,12 +195,9 @@ func (portal *Portal) sendMessageMetrics(evt *event.Event, err error, part strin
 			level = log.LevelDebug
 		}
 		portal.log.Logfln(level, "%s %s %s from %s: %v", part, msgType, evtDescription, evt.Sender, err)
-		reason, isCertain, _, sendNotice := errorToStatusReason(err)
-		status := bridge.ReasonToCheckpointStatus(reason)
-		if errors.Is(err, errMessageTakingLong) {
-			status = bridge.MsgStatusWillRetry
-		}
-		portal.bridge.SendMessageCheckpoint(evt, bridge.MsgStepRemote, err, status, ms.getRetryNum())
+		reason, status, isCertain, sendNotice, _ := errorToStatusReason(err)
+		checkpointStatus := bridge.ReasonToCheckpointStatus(reason, status)
+		portal.bridge.SendMessageCheckpoint(evt, bridge.MsgStepRemote, err, checkpointStatus, ms.getRetryNum())
 		if sendNotice {
 			ms.setNoticeID(portal.sendErrorMessage(evt, err, isCertain, ms.getNoticeID()))
 		}
@@ -214,6 +213,65 @@ func (portal *Portal) sendMessageMetrics(evt *event.Event, err error, part strin
 			})
 		}
 	}
+	if ms != nil {
+		portal.log.Debugfln("Timings for %s: %s", evt.ID, ms.timings.String())
+	}
+}
+
+type messageTimings struct {
+	initReceive  time.Duration
+	decrypt      time.Duration
+	implicitRR   time.Duration
+	portalQueue  time.Duration
+	totalReceive time.Duration
+
+	preproc   time.Duration
+	convert   time.Duration
+	whatsmeow whatsmeow.MessageDebugTimings
+	totalSend time.Duration
+}
+
+func niceRound(dur time.Duration) time.Duration {
+	switch {
+	case dur < time.Millisecond:
+		return dur
+	case dur < time.Second:
+		return dur.Round(100 * time.Microsecond)
+	default:
+		return dur.Round(time.Millisecond)
+	}
+}
+
+func (mt *messageTimings) String() string {
+	mt.initReceive = niceRound(mt.initReceive)
+	mt.decrypt = niceRound(mt.decrypt)
+	mt.portalQueue = niceRound(mt.portalQueue)
+	mt.totalReceive = niceRound(mt.totalReceive)
+	mt.implicitRR = niceRound(mt.implicitRR)
+	mt.preproc = niceRound(mt.preproc)
+	mt.convert = niceRound(mt.convert)
+	mt.whatsmeow.Queue = niceRound(mt.whatsmeow.Queue)
+	mt.whatsmeow.Marshal = niceRound(mt.whatsmeow.Marshal)
+	mt.whatsmeow.GetParticipants = niceRound(mt.whatsmeow.GetParticipants)
+	mt.whatsmeow.GetDevices = niceRound(mt.whatsmeow.GetDevices)
+	mt.whatsmeow.GroupEncrypt = niceRound(mt.whatsmeow.GroupEncrypt)
+	mt.whatsmeow.PeerEncrypt = niceRound(mt.whatsmeow.PeerEncrypt)
+	mt.whatsmeow.Send = niceRound(mt.whatsmeow.Send)
+	mt.whatsmeow.Resp = niceRound(mt.whatsmeow.Resp)
+	mt.whatsmeow.Retry = niceRound(mt.whatsmeow.Retry)
+	mt.totalSend = niceRound(mt.totalSend)
+	whatsmeowTimings := "N/A"
+	if mt.totalSend > 0 {
+		format := "queue: %[1]s, marshal: %[2]s, ske: %[3]s, pcp: %[4]s, dev: %[5]s, encrypt: %[6]s, send: %[7]s, resp: %[8]s"
+		if mt.whatsmeow.GetParticipants == 0 && mt.whatsmeow.GroupEncrypt == 0 {
+			format = "queue: %[1]s, marshal: %[2]s, dev: %[5]s, encrypt: %[6]s, send: %[7]s, resp: %[8]s"
+		}
+		if mt.whatsmeow.Retry > 0 {
+			format += ", retry: %[9]s"
+		}
+		whatsmeowTimings = fmt.Sprintf(format, mt.whatsmeow.Queue, mt.whatsmeow.Marshal, mt.whatsmeow.GroupEncrypt, mt.whatsmeow.GetParticipants, mt.whatsmeow.GetDevices, mt.whatsmeow.PeerEncrypt, mt.whatsmeow.Send, mt.whatsmeow.Resp, mt.whatsmeow.Retry)
+	}
+	return fmt.Sprintf("BRIDGE: receive: %s, decrypt: %s, queue: %s, total hs->portal: %s, implicit rr: %s -- PORTAL: preprocess: %s, convert: %s, total send: %s -- WHATSMEOW: %s", mt.initReceive, mt.decrypt, mt.implicitRR, mt.portalQueue, mt.totalReceive, mt.preproc, mt.convert, mt.totalSend, whatsmeowTimings)
 }
 
 type metricSender struct {
@@ -222,6 +280,7 @@ type metricSender struct {
 	lock           sync.Mutex
 	completed      bool
 	retryNum       int
+	timings        *messageTimings
 }
 
 func (ms *metricSender) getRetryNum() int {
