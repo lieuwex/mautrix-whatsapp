@@ -1825,15 +1825,15 @@ func (portal *Portal) convertTemplateMessage(intent *appservice.IntentAPI, sourc
 
 	var convertedTitle *ConvertedMessage
 	switch title := tpl.GetTitle().(type) {
-	case *waProto.HydratedFourRowTemplate_DocumentMessage:
+	case *waProto.TemplateMessage_HydratedFourRowTemplate_DocumentMessage:
 		convertedTitle = portal.convertMediaMessage(intent, source, info, title.DocumentMessage, "file attachment", false)
-	case *waProto.HydratedFourRowTemplate_ImageMessage:
+	case *waProto.TemplateMessage_HydratedFourRowTemplate_ImageMessage:
 		convertedTitle = portal.convertMediaMessage(intent, source, info, title.ImageMessage, "photo", false)
-	case *waProto.HydratedFourRowTemplate_VideoMessage:
+	case *waProto.TemplateMessage_HydratedFourRowTemplate_VideoMessage:
 		convertedTitle = portal.convertMediaMessage(intent, source, info, title.VideoMessage, "video attachment", false)
-	case *waProto.HydratedFourRowTemplate_LocationMessage:
+	case *waProto.TemplateMessage_HydratedFourRowTemplate_LocationMessage:
 		content = fmt.Sprintf("Unsupported location message\n\n%s", content)
-	case *waProto.HydratedFourRowTemplate_HydratedTitleText:
+	case *waProto.TemplateMessage_HydratedFourRowTemplate_HydratedTitleText:
 		content = fmt.Sprintf("%s\n\n%s", title.HydratedTitleText, content)
 	}
 
@@ -1891,7 +1891,7 @@ func (portal *Portal) convertListMessage(intent *appservice.IntentAPI, source *U
 			body = fmt.Sprintf("%s\n\n%s", msg.GetTitle(), body)
 		}
 	}
-	randomID := appservice.RandomString(64)
+	randomID := util.RandomString(64)
 	body = fmt.Sprintf("%s\n%s", body, randomID)
 	if msg.GetFooterText() != "" {
 		body = fmt.Sprintf("%s\n\n%s", body, msg.GetFooterText())
@@ -2648,7 +2648,7 @@ func (portal *Portal) handleMediaRetry(retry *events.MediaRetry, source *User) {
 		portal.sendMediaRetryFailureEdit(intent, msg, err)
 		return
 	} else if retryData.GetResult() != waProto.MediaRetryNotification_SUCCESS {
-		errorName := waProto.MediaRetryNotification_MediaRetryNotificationResultType_name[int32(retryData.GetResult())]
+		errorName := waProto.MediaRetryNotification_ResultType_name[int32(retryData.GetResult())]
 		if retryData.GetDirectPath() == "" {
 			portal.log.Warnfln("Got error response in media retry notification for %s: %s", retry.MessageID, errorName)
 			portal.log.Debugfln("Error response contents: %+v", retryData)
@@ -3108,6 +3108,14 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 			FileSha256:    media.FileSHA256,
 			FileLength:    proto.Uint64(uint64(media.FileLength)),
 		}
+		if media.Caption != "" {
+			msg.DocumentWithCaptionMessage = &waProto.FutureProofMessage{
+				Message: &waProto.Message{
+					DocumentMessage: msg.DocumentMessage,
+				},
+			}
+			msg.DocumentMessage = nil
+		}
 	case event.MsgLocation:
 		lat, long, err := parseGeoURI(content.GeoURI)
 		if err != nil {
@@ -3335,13 +3343,12 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 		go portal.sendMessageMetrics(evt, errTargetNotFound, "Ignoring", nil)
 	} else if msg.IsFakeJID() {
 		go portal.sendMessageMetrics(evt, errTargetIsFake, "Ignoring", nil)
-	} else if msg.Sender.User != sender.JID.User {
-		go portal.sendMessageMetrics(evt, errTargetSentBySomeoneElse, "Ignoring", nil)
 	} else if portal.Key.JID == types.StatusBroadcastJID && portal.bridge.Config.Bridge.DisableStatusBroadcastSend {
 		go portal.sendMessageMetrics(evt, errBroadcastSendDisabled, "Ignoring", nil)
-		return
 	} else if msg.Type == database.MsgReaction {
-		if reaction := portal.bridge.DB.Reaction.GetByMXID(evt.Redacts); reaction == nil {
+		if msg.Sender.User != sender.JID.User {
+			go portal.sendMessageMetrics(evt, errReactionSentBySomeoneElse, "Ignoring", nil)
+		} else if reaction := portal.bridge.DB.Reaction.GetByMXID(evt.Redacts); reaction == nil {
 			go portal.sendMessageMetrics(evt, errReactionDatabaseNotFound, "Ignoring", nil)
 		} else if reactionTarget := reaction.GetTarget(); reactionTarget == nil {
 			go portal.sendMessageMetrics(evt, errReactionTargetNotFound, "Ignoring", nil)
@@ -3351,8 +3358,26 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 			go portal.sendMessageMetrics(evt, err, "Error sending", nil)
 		}
 	} else {
+		key := &waProto.MessageKey{
+			FromMe:    proto.Bool(true),
+			Id:        proto.String(msg.JID),
+			RemoteJid: proto.String(portal.Key.JID.String()),
+		}
+		if msg.Sender.User != sender.JID.User {
+			if portal.IsPrivateChat() {
+				go portal.sendMessageMetrics(evt, errDMSentByOtherUser, "Ignoring", nil)
+				return
+			}
+			key.FromMe = proto.Bool(false)
+			key.Participant = proto.String(msg.Sender.ToNonAD().String())
+		}
 		portal.log.Debugfln("Sending redaction %s of %s/%s to WhatsApp", evt.ID, msg.MXID, msg.JID)
-		_, err := sender.Client.RevokeMessage(portal.Key.JID, msg.JID)
+		_, err := sender.Client.SendMessage(context.TODO(), portal.Key.JID, "", &waProto.Message{
+			ProtocolMessage: &waProto.ProtocolMessage{
+				Type: waProto.ProtocolMessage_REVOKE.Enum(),
+				Key:  key,
+			},
+		})
 		go portal.sendMessageMetrics(evt, err, "Error sending", nil)
 	}
 }
