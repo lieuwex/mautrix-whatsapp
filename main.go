@@ -36,6 +36,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridge"
 	"maunium.net/go/mautrix/bridge/commands"
+	"maunium.net/go/mautrix/bridge/status"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 	"maunium.net/go/mautrix/util/configupgrade"
@@ -93,8 +94,8 @@ func (br *WABridge) Init() {
 		Segment.log.Infoln("Segment metrics are enabled")
 	}
 
-	br.DB = database.New(br.Bridge.DB)
-	br.WAContainer = sqlstore.NewWithDB(br.DB.DB, br.DB.Dialect.String(), &waLogger{br.DB.Log.Sub("WhatsApp")})
+	br.DB = database.New(br.Bridge.DB, br.Log.Sub("Database"))
+	br.WAContainer = sqlstore.NewWithDB(br.DB.RawDB, br.DB.Dialect.String(), &waLogger{br.Log.Sub("Database").Sub("WhatsApp")})
 	br.WAContainer.DatabaseErrorHandler = br.DB.HandleSignalStoreError
 
 	ss := br.Config.Bridge.Provisioning.SharedSecret
@@ -194,7 +195,7 @@ func (br *WABridge) StartUsers() {
 		go user.Connect()
 	}
 	if !foundAnySessions {
-		br.SendGlobalBridgeState(bridge.State{StateEvent: bridge.StateUnconfigured}.Fill(nil))
+		br.SendGlobalBridgeState(status.BridgeState{StateEvent: status.StateUnconfigured}.Fill(nil))
 	}
 	br.Log.Debugln("Starting custom puppets")
 	for _, loopuppet := range br.GetAllPuppetsWithCustomMXID() {
@@ -261,7 +262,7 @@ func main() {
 		Name:         "mautrix-whatsapp",
 		URL:          "https://github.com/mautrix/whatsapp",
 		Description:  "A Matrix-WhatsApp puppeting bridge.",
-		Version:      "0.6.0",
+		Version:      "0.6.1",
 		ProtocolName: "WhatsApp",
 
 		CryptoPickleKey: "maunium.net/go/mautrix-whatsapp",

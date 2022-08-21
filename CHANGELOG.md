@@ -1,3 +1,10 @@
+# v0.6.1 (2022-08-16)
+
+* Added support for "Delete for me" and deleting private chats from WhatsApp.
+* Added support for admin deletions in groups.
+* Document with caption messages should work with the bridge as soon as
+  WhatsApp enables them in their apps.
+
 # v0.6.0 (2022-07-16)
 
 * Started requiring homeservers to advertise Matrix v1.1 support.
