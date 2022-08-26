@@ -101,6 +101,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "encryption", "allow")
 	helper.Copy(up.Bool, "bridge", "encryption", "default")
 	helper.Copy(up.Bool, "bridge", "encryption", "require")
+	helper.Copy(up.Bool, "bridge", "encryption", "appservice")
 	helper.Copy(up.Str, "bridge", "encryption", "verification_levels", "receive")
 	helper.Copy(up.Str, "bridge", "encryption", "verification_levels", "send")
 	helper.Copy(up.Str, "bridge", "encryption", "verification_levels", "share")
@@ -140,7 +141,7 @@ func DoUpgrade(helper *up.Helper) {
 }
 
 var SpacedBlocks = [][]string{
-	{"homeserver", "asmux"},
+	{"homeserver", "software"},
 	{"appservice"},
 	{"appservice", "hostname"},
 	{"appservice", "database"},
