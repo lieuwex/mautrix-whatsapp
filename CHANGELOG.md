@@ -1,4 +1,19 @@
-# v0.7.0 (unreleased)
+# v0.7.1 (2022-10-16)
+
+* Added support for wa.me/qr links in `!wa resolve-link`.
+* Added option to sync group members in parallel to speed up syncing large
+  groups.
+* Added initial support for WhatsApp message editing.
+  * Sending edits will be disabled by default until official WhatsApp clients
+    start rendering edits.
+* Changed `private_chat_portal_meta` config option to be implicitly enabled in
+  encrypted rooms, matching the behavior of other mautrix bridges.
+* Updated media bridging to check homeserver media size limit before
+  downloading media to avoid running out of memory.
+  * The bridge may still run out of ram when bridging files if your homeserver
+    has a large media size limit and a low bridge memory limit.
+
+# v0.7.0 (2022-09-16)
 
 * Bumped minimum Go version to 1.18.
 * Added hidden option to use appservice login for double puppeting.
@@ -9,9 +24,16 @@
     `sync_with_custom_puppets` in the config, then regenerating the registration
     file.
 * Updated sticker bridging to send actual sticker messages to WhatsApp rather
-  than sending as image. This includes converting stickers to webp.
+  than sending as image. This includes converting stickers to webp and adding
+  transparent padding to make the aspect ratio 1:1.
 * Added automatic webm -> mp4 conversion when sending videos to WhatsApp.
 * Started rejecting unsupported mime types when sending media to WhatsApp.
+* Added option to use [MSC2409] and [MSC3202] for end-to-bridge encryption.
+  However, this may not work with the Synapse implementation as it hasn't
+  been tested yet.
+* Added error notice if the bridge is started twice.
+
+[MSC3202]: https://github.com/matrix-org/matrix-spec-proposals/pull/3202
 
 # v0.6.1 (2022-08-16)
 

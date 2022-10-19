@@ -52,6 +52,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Str, "bridge", "history_sync", "media_requests", "request_method")
 	helper.Copy(up.Int, "bridge", "history_sync", "media_requests", "request_local_time")
 	helper.Copy(up.Int, "bridge", "history_sync", "max_initial_conversations")
+	helper.Copy(up.Int, "bridge", "history_sync", "unread_hours_threshold")
 	helper.Copy(up.Int, "bridge", "history_sync", "immediate", "worker_count")
 	helper.Copy(up.Int, "bridge", "history_sync", "immediate", "max_events")
 	helper.Copy(up.List, "bridge", "history_sync", "deferred")
@@ -73,6 +74,7 @@ func DoUpgrade(helper *up.Helper) {
 		helper.Copy(up.Map, "bridge", "login_shared_secret_map")
 	}
 	helper.Copy(up.Bool, "bridge", "private_chat_portal_meta")
+	helper.Copy(up.Bool, "bridge", "parallel_member_sync")
 	helper.Copy(up.Bool, "bridge", "bridge_notices")
 	helper.Copy(up.Bool, "bridge", "resend_bridge_info")
 	helper.Copy(up.Bool, "bridge", "mute_bridging")
@@ -89,8 +91,10 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "bridge", "federate_rooms")
 	helper.Copy(up.Bool, "bridge", "disappearing_messages_in_groups")
 	helper.Copy(up.Bool, "bridge", "disable_bridge_alerts")
+	helper.Copy(up.Bool, "bridge", "crash_on_stream_replaced")
 	helper.Copy(up.Bool, "bridge", "url_previews")
 	helper.Copy(up.Bool, "bridge", "caption_in_message")
+	helper.Copy(up.Bool, "bridge", "send_whatsapp_edits")
 	helper.Copy(up.Str|up.Null, "bridge", "message_handling_timeout", "error_after")
 	helper.Copy(up.Str|up.Null, "bridge", "message_handling_timeout", "deadline")
 

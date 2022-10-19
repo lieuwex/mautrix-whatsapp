@@ -63,6 +63,7 @@ type BridgeConfig struct {
 		DoublePuppetBackfill    bool `yaml:"double_puppet_backfill"`
 		RequestFullSync         bool `yaml:"request_full_sync"`
 		MaxInitialConversations int  `yaml:"max_initial_conversations"`
+		UnreadHoursThreshold    int  `yaml:"unread_hours_threshold"`
 
 		Immediate struct {
 			WorkerCount int `yaml:"worker_count"`
@@ -94,6 +95,7 @@ type BridgeConfig struct {
 	LoginSharedSecretMap       map[string]string `yaml:"login_shared_secret_map"`
 
 	PrivateChatPortalMeta bool   `yaml:"private_chat_portal_meta"`
+	ParallelMemberSync    bool   `yaml:"parallel_member_sync"`
 	BridgeNotices         bool   `yaml:"bridge_notices"`
 	ResendBridgeInfo      bool   `yaml:"resend_bridge_info"`
 	MuteBridging          bool   `yaml:"mute_bridging"`
@@ -109,6 +111,7 @@ type BridgeConfig struct {
 	FederateRooms         bool   `yaml:"federate_rooms"`
 	URLPreviews           bool   `yaml:"url_previews"`
 	CaptionInMessage      bool   `yaml:"caption_in_message"`
+	SendWhatsAppEdits     bool   `yaml:"send_whatsapp_edits"`
 
 	MessageHandlingTimeout struct {
 		ErrorAfterStr string `yaml:"error_after"`
@@ -121,7 +124,8 @@ type BridgeConfig struct {
 	DisableStatusBroadcastSend   bool `yaml:"disable_status_broadcast_send"`
 	DisappearingMessagesInGroups bool `yaml:"disappearing_messages_in_groups"`
 
-	DisableBridgeAlerts bool `yaml:"disable_bridge_alerts"`
+	DisableBridgeAlerts   bool `yaml:"disable_bridge_alerts"`
+	CrashOnStreamReplaced bool `yaml:"crash_on_stream_replaced"`
 
 	CommandPrefix string `yaml:"command_prefix"`
 
