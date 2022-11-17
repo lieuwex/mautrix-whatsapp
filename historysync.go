@@ -399,7 +399,7 @@ func (user *User) handleHistorySync(backfillQueue *BackfillQueue, evt *waProto.H
 			switch evt.GetSyncType() {
 			case waProto.HistorySync_INITIAL_BOOTSTRAP:
 				// Enqueue immediate backfills for the most recent messages first.
-				user.EnqueueImmedateBackfills(portals)
+				user.EnqueueImmediateBackfills(portals)
 			case waProto.HistorySync_FULL, waProto.HistorySync_RECENT:
 				user.EnqueueForwardBackfills(portals)
 				// Enqueue deferred backfills as configured.
@@ -420,7 +420,7 @@ func getConversationTimestamp(conv *waProto.Conversation) uint64 {
 	return convTs
 }
 
-func (user *User) EnqueueImmedateBackfills(portals []*Portal) {
+func (user *User) EnqueueImmediateBackfills(portals []*Portal) {
 	for priority, portal := range portals {
 		maxMessages := user.bridge.Config.Bridge.HistorySync.Immediate.MaxEvents
 		initialBackfill := user.bridge.DB.Backfill.NewWithValues(user.MXID, database.BackfillImmediate, priority, &portal.Key, nil, maxMessages, maxMessages, 0)
@@ -788,10 +788,10 @@ func (portal *Portal) finishBatch(txn dbutil.Transaction, eventIDs []id.EventID,
 			if info.ExpirationStart > 0 {
 				remainingSeconds := time.Unix(int64(info.ExpirationStart), 0).Add(time.Duration(info.ExpiresIn) * time.Second).Sub(time.Now()).Seconds()
 				portal.log.Debugfln("Disappearing history sync message: expires in %d, started at %d, remaining %d", info.ExpiresIn, info.ExpirationStart, int(remainingSeconds))
-				portal.MarkDisappearing(eventID, uint32(remainingSeconds), true)
+				portal.MarkDisappearing(txn, eventID, uint32(remainingSeconds), true)
 			} else {
 				portal.log.Debugfln("Disappearing history sync message: expires in %d (not started)", info.ExpiresIn)
-				portal.MarkDisappearing(eventID, info.ExpiresIn, false)
+				portal.MarkDisappearing(txn, eventID, info.ExpiresIn, false)
 			}
 		}
 	}

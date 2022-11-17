@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"image"
 	"image/color"
 	_ "image/gif"
@@ -743,7 +742,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		var eventID id.EventID
 		var lastEventID id.EventID
 		if existingMsg != nil {
-			portal.MarkDisappearing(existingMsg.MXID, converted.ExpiresIn, false)
+			portal.MarkDisappearing(nil, existingMsg.MXID, converted.ExpiresIn, false)
 			converted.Content.SetEdit(existingMsg.MXID)
 		} else if converted.ReplyTo != nil {
 			portal.SetReply(converted.Content, converted.ReplyTo, false)
@@ -758,7 +757,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			portal.log.Errorfln("Failed to send %s to Matrix: %v", msgID, err)
 		} else {
 			if editTargetMsg == nil {
-				portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
+				portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, false)
 			}
 			eventID = resp.EventID
 			lastEventID = eventID
@@ -769,7 +768,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			if err != nil {
 				portal.log.Errorfln("Failed to send caption of %s to Matrix: %v", msgID, err)
 			} else {
-				portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
+				portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, false)
 				lastEventID = resp.EventID
 			}
 		}
@@ -779,7 +778,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 				if err != nil {
 					portal.log.Errorfln("Failed to send sub-event %d of %s to Matrix: %v", index+1, msgID, err)
 				} else {
-					portal.MarkDisappearing(resp.EventID, converted.ExpiresIn, false)
+					portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, false)
 					lastEventID = resp.EventID
 				}
 			}
@@ -1627,7 +1626,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 
 	if user.bridge.Config.Bridge.HistorySync.Backfill && backfill {
 		portals := []*Portal{portal}
-		user.EnqueueImmedateBackfills(portals)
+		user.EnqueueImmediateBackfills(portals)
 		user.EnqueueDeferredBackfills(portals)
 		user.BackfillQueue.ReCheck()
 	}
@@ -2174,7 +2173,7 @@ type InviteMeta struct {
 
 func (portal *Portal) convertGroupInviteMessage(intent *appservice.IntentAPI, info *types.MessageInfo, msg *waProto.GroupInviteMessage) *ConvertedMessage {
 	expiry := time.Unix(msg.GetInviteExpiration(), 0)
-	htmlMessage := fmt.Sprintf(inviteMsg, html.EscapeString(msg.GetCaption()), msg.GetGroupName(), expiry)
+	htmlMessage := fmt.Sprintf(inviteMsg, event.TextToHTML(msg.GetCaption()), msg.GetGroupName(), expiry)
 	content := &event.MessageEventContent{
 		MsgType:       event.MsgText,
 		Body:          format.HTMLToText(htmlMessage),
@@ -3138,11 +3137,7 @@ func (portal *Portal) addRelaybotFormat(sender *User, content *event.MessageEven
 	if member == nil {
 		member = &event.MemberEventContent{}
 	}
-
-	if content.Format != event.FormatHTML {
-		content.FormattedBody = strings.Replace(html.EscapeString(content.Body), "\n", "<br/>", -1)
-		content.Format = event.FormatHTML
-	}
+	content.EnsureHasHTML()
 	data, err := portal.bridge.Config.Bridge.Relay.FormatMessage(content, sender.MXID, *member)
 	if err != nil {
 		portal.log.Errorln("Failed to apply relaybot format:", err)
@@ -3410,6 +3405,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 						},
 						Type:          waProto.ProtocolMessage_MESSAGE_EDIT.Enum(),
 						EditedMessage: msg,
+						TimestampMs:   proto.Int64(evt.Timestamp),
 					},
 				},
 			},
@@ -3503,7 +3499,7 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 	}
 	dbMsgType := database.MsgNormal
 	if msg.EditedMessage == nil {
-		portal.MarkDisappearing(origEvtID, portal.ExpirationTime, true)
+		portal.MarkDisappearing(nil, origEvtID, portal.ExpirationTime, true)
 	} else {
 		dbMsgType = database.MsgEdit
 	}
