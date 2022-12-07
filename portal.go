@@ -19,6 +19,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +33,7 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"reflect"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -245,6 +248,7 @@ type Portal struct {
 	avatarLock     sync.Mutex
 
 	latestEventBackfillLock sync.Mutex
+	parentGroupUpdateLock   sync.Mutex
 
 	recentlyHandled      [recentlyHandledLength]recentlyHandledWrapper
 	recentlyHandledLock  sync.Mutex
@@ -259,7 +263,8 @@ type Portal struct {
 
 	mediaErrorCache map[types.MessageID]*FailedMediaMeta
 
-	relayUser *User
+	relayUser    *User
+	parentPortal *Portal
 }
 
 var (
@@ -313,7 +318,7 @@ func (portal *Portal) handleMatrixMessageLoopItem(msg PortalMatrixMessage) {
 	portal.handleMatrixReadReceipt(msg.user, "", evtTS, false)
 	timings.implicitRR = time.Since(implicitRRStart)
 	switch msg.evt.Type {
-	case event.EventMessage, event.EventSticker:
+	case event.EventMessage, event.EventSticker, TypeMSC3881V2PollResponse, TypeMSC3881PollResponse:
 		portal.HandleMatrixMessage(msg.user, msg.evt, timings)
 	case event.EventRedaction:
 		portal.HandleMatrixRedaction(msg.user, msg.evt)
@@ -383,7 +388,7 @@ func containsSupportedMessage(waMsg *waProto.Message) bool {
 		waMsg.DocumentMessage != nil || waMsg.ContactMessage != nil || waMsg.LocationMessage != nil ||
 		waMsg.LiveLocationMessage != nil || waMsg.GroupInviteMessage != nil || waMsg.ContactsArrayMessage != nil ||
 		waMsg.HighlyStructuredMessage != nil || waMsg.TemplateMessage != nil || waMsg.TemplateButtonReplyMessage != nil ||
-		waMsg.ListMessage != nil || waMsg.ListResponseMessage != nil
+		waMsg.ListMessage != nil || waMsg.ListResponseMessage != nil || waMsg.PollCreationMessage != nil
 }
 
 func getMessageType(waMsg *waProto.Message) string {
@@ -414,6 +419,12 @@ func getMessageType(waMsg *waProto.Message) string {
 		return "group invite"
 	case waMsg.ReactionMessage != nil:
 		return "reaction"
+	case waMsg.EncReactionMessage != nil:
+		return "encrypted reaction"
+	case waMsg.PollCreationMessage != nil:
+		return "poll create"
+	case waMsg.PollUpdateMessage != nil:
+		return "poll update"
 	case waMsg.ProtocolMessage != nil:
 		switch waMsg.GetProtocolMessage().GetType() {
 		case waProto.ProtocolMessage_REVOKE:
@@ -527,6 +538,10 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 		return portal.convertListMessage(intent, source, waMsg.GetListMessage())
 	case waMsg.ListResponseMessage != nil:
 		return portal.convertListResponseMessage(intent, waMsg.GetListResponseMessage())
+	case waMsg.PollCreationMessage != nil:
+		return portal.convertPollCreationMessage(intent, waMsg.GetPollCreationMessage())
+	case waMsg.PollUpdateMessage != nil:
+		return portal.convertPollUpdateMessage(intent, source, info, waMsg.GetPollUpdateMessage())
 	case waMsg.ImageMessage != nil:
 		return portal.convertMediaMessage(intent, source, info, waMsg.GetImageMessage(), "photo", isBackfill)
 	case waMsg.StickerMessage != nil:
@@ -795,8 +810,17 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		if len(eventID) != 0 {
 			portal.finishHandling(existingMsg, &evt.Info, eventID, dbMsgType, converted.Error)
 		}
-	} else if msgType == "reaction" {
-		portal.HandleMessageReaction(intent, source, &evt.Info, evt.Message.GetReactionMessage(), existingMsg)
+	} else if msgType == "reaction" || msgType == "encrypted reaction" {
+		if evt.Message.GetEncReactionMessage() != nil {
+			decryptedReaction, err := source.Client.DecryptReaction(evt)
+			if err != nil {
+				portal.log.Errorfln("Failed to decrypt reaction from %s to %s: %v", evt.Info.Sender, evt.Message.GetEncReactionMessage().GetTargetMessageKey().GetId(), err)
+			} else {
+				portal.HandleMessageReaction(intent, source, &evt.Info, decryptedReaction, existingMsg)
+			}
+		} else {
+			portal.HandleMessageReaction(intent, source, &evt.Info, evt.Message.GetReactionMessage(), existingMsg)
+		}
 	} else if msgType == "revoke" {
 		portal.HandleMessageRevoke(source, &evt.Info, evt.Message.GetProtocolMessage().GetKey())
 		if existingMsg != nil {
@@ -1172,6 +1196,27 @@ func (portal *Portal) UpdateTopic(topic string, setBy types.JID, updateInfo bool
 	return false
 }
 
+func (portal *Portal) UpdateParentGroup(source *User, parent types.JID, updateInfo bool) bool {
+	portal.parentGroupUpdateLock.Lock()
+	defer portal.parentGroupUpdateLock.Unlock()
+	if portal.ParentGroup != parent {
+		portal.log.Debugfln("Updating parent group %v -> %v", portal.ParentGroup, parent)
+		portal.updateCommunitySpace(source, false, false)
+		portal.ParentGroup = parent
+		portal.parentPortal = nil
+		portal.InSpace = false
+		portal.updateCommunitySpace(source, true, false)
+		if updateInfo {
+			portal.UpdateBridgeInfo()
+			portal.Update(nil)
+		}
+		return true
+	} else if !portal.ParentGroup.IsEmpty() && !portal.InSpace {
+		return portal.updateCommunitySpace(source, true, updateInfo)
+	}
+	return false
+}
+
 func (portal *Portal) UpdateMetadata(user *User, groupInfo *types.GroupInfo) bool {
 	if portal.IsPrivateChat() {
 		return false
@@ -1208,9 +1253,17 @@ func (portal *Portal) UpdateMetadata(user *User, groupInfo *types.GroupInfo) boo
 	update := false
 	update = portal.UpdateName(groupInfo.Name, groupInfo.NameSetBy, false) || update
 	update = portal.UpdateTopic(groupInfo.Topic, groupInfo.TopicSetBy, false) || update
+	update = portal.UpdateParentGroup(user, groupInfo.LinkedParentJID, false) || update
 	if portal.ExpirationTime != groupInfo.DisappearingTimer {
 		update = true
 		portal.ExpirationTime = groupInfo.DisappearingTimer
+	}
+	if portal.IsParent != groupInfo.IsParent {
+		if portal.MXID != "" {
+			portal.log.Warnfln("Existing group changed is_parent from %t to %t", portal.IsParent, groupInfo.IsParent)
+		}
+		portal.IsParent = groupInfo.IsParent
+		update = true
 	}
 
 	portal.RestrictMessageSending(groupInfo.IsAnnounce)
@@ -1230,7 +1283,7 @@ func (portal *Portal) UpdateMatrixRoom(user *User, groupInfo *types.GroupInfo) b
 	portal.log.Infoln("Syncing portal for", user.MXID)
 
 	portal.ensureUserInvited(user)
-	go portal.addToSpace(user)
+	go portal.addToPersonalSpace(user)
 
 	update := false
 	update = portal.UpdateMetadata(user, groupInfo) || update
@@ -1379,6 +1432,13 @@ func (portal *Portal) getBridgeInfo() (string, event.BridgeEventContent) {
 			AvatarURL:   portal.AvatarURL.CUString(),
 		},
 	}
+	if parent := portal.GetParentPortal(); parent != nil {
+		bridgeInfo.Network = &event.BridgeInfoSection{
+			ID:          parent.Key.JID.String(),
+			DisplayName: parent.Name,
+			AvatarURL:   parent.AvatarURL.CUString(),
+		}
+	}
 	return portal.getBridgeInfoStateKey(), bridgeInfo
 }
 
@@ -1480,8 +1540,26 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 		if groupInfo != nil {
 			portal.Name = groupInfo.Name
 			portal.Topic = groupInfo.Topic
+			portal.IsParent = groupInfo.IsParent
+			portal.ParentGroup = groupInfo.LinkedParentJID
+			if groupInfo.IsEphemeral {
+				portal.ExpirationTime = groupInfo.DisappearingTimer
+			}
 		}
 		portal.UpdateAvatar(user, types.EmptyJID, false)
+	}
+
+	powerLevels := portal.GetBasePowerLevels()
+
+	if groupInfo != nil {
+		if groupInfo.IsAnnounce {
+			powerLevels.EventsDefault = 50
+		}
+		if groupInfo.IsLocked {
+			powerLevels.EnsureEventLevel(event.StateRoomName, 50)
+			powerLevels.EnsureEventLevel(event.StateRoomAvatar, 50)
+			powerLevels.EnsureEventLevel(event.StateTopic, 50)
+		}
 	}
 
 	bridgeInfoStateKey, bridgeInfo := portal.getBridgeInfo()
@@ -1489,7 +1567,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	initialState := []*event.Event{{
 		Type: event.StatePowerLevels,
 		Content: event.Content{
-			Parsed: portal.GetBasePowerLevels(),
+			Parsed: powerLevels,
 		},
 	}, {
 		Type:     event.StateBridge,
@@ -1530,6 +1608,20 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	if !portal.bridge.Config.Bridge.FederateRooms {
 		creationContent["m.federate"] = false
 	}
+	if portal.IsParent {
+		creationContent["type"] = event.RoomTypeSpace
+	} else if parent := portal.GetParentPortal(); parent != nil && parent.MXID != "" {
+		initialState = append(initialState, &event.Event{
+			Type:     event.StateSpaceParent,
+			StateKey: proto.String(parent.MXID.String()),
+			Content: event.Content{
+				Parsed: &event.SpaceParentEventContent{
+					Via:       []string{portal.bridge.Config.Homeserver.Domain},
+					Canonical: true,
+				},
+			},
+		})
+	}
 	autoJoinInvites := portal.bridge.Config.Homeserver.Software == bridgeconfig.SoftwareHungry
 	if autoJoinInvites {
 		portal.log.Debugfln("Hungryserv mode: adding all group members in create request")
@@ -1560,6 +1652,8 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	if err != nil {
 		return err
 	}
+	portal.log.Infoln("Matrix room created:", portal.MXID)
+	portal.InSpace = false
 	portal.NameSet = len(portal.Name) > 0
 	portal.TopicSet = len(portal.Topic) > 0
 	portal.MXID = resp.RoomID
@@ -1567,7 +1661,6 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	portal.bridge.portalsByMXID[portal.MXID] = portal
 	portal.bridge.portalsLock.Unlock()
 	portal.Update(nil)
-	portal.log.Infoln("Matrix room created:", portal.MXID)
 
 	// We set the memberships beforehand to make sure the encryption key exchange in initial backfill knows the users are here.
 	inviteMembership := event.MembershipInvite
@@ -1583,22 +1676,11 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	}
 	user.syncChatDoublePuppetDetails(portal, true)
 
-	go portal.addToSpace(user)
+	go portal.updateCommunitySpace(user, true, true)
+	go portal.addToPersonalSpace(user)
 
-	if groupInfo != nil {
-		if groupInfo.IsEphemeral {
-			portal.ExpirationTime = groupInfo.DisappearingTimer
-			portal.Update(nil)
-		}
-		if !autoJoinInvites {
-			portal.SyncParticipants(user, groupInfo)
-		}
-		if groupInfo.IsAnnounce {
-			portal.RestrictMessageSending(groupInfo.IsAnnounce)
-		}
-		if groupInfo.IsLocked {
-			portal.RestrictMetadataChanges(groupInfo.IsLocked)
-		}
+	if groupInfo != nil && !autoJoinInvites {
+		portal.SyncParticipants(user, groupInfo)
 	}
 	//if broadcastMetadata != nil {
 	//	portal.SyncBroadcastRecipients(user, broadcastMetadata)
@@ -1633,7 +1715,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	return nil
 }
 
-func (portal *Portal) addToSpace(user *User) {
+func (portal *Portal) addToPersonalSpace(user *User) {
 	spaceID := user.GetSpaceRoom()
 	if len(spaceID) == 0 || user.IsInSpace(portal.Key) {
 		return
@@ -1647,6 +1729,63 @@ func (portal *Portal) addToSpace(user *User) {
 		portal.log.Debugfln("Added room to %s's personal filtering space (%s)", user.MXID, spaceID)
 		user.MarkInSpace(portal.Key)
 	}
+}
+
+func (portal *Portal) removeSpaceParentEvent(space id.RoomID) {
+	_, err := portal.MainIntent().SendStateEvent(portal.MXID, event.StateSpaceParent, space.String(), &event.SpaceParentEventContent{})
+	if err != nil {
+		portal.log.Warnfln("Failed to send m.space.parent event to remove portal from %s: %v", space, err)
+	}
+}
+
+func (portal *Portal) updateCommunitySpace(user *User, add, updateInfo bool) bool {
+	if add == portal.InSpace {
+		return false
+	}
+	space := portal.GetParentPortal()
+	if space == nil {
+		return false
+	} else if space.MXID == "" {
+		if !add {
+			return false
+		}
+		portal.log.Debugfln("Creating portal for parent group %v", space.Key.JID)
+		err := space.CreateMatrixRoom(user, nil, false, false)
+		if err != nil {
+			portal.log.Debugfln("Failed to create portal for parent group: %v", err)
+			return false
+		}
+	}
+
+	var action string
+	var parentContent event.SpaceParentEventContent
+	var childContent event.SpaceChildEventContent
+	if add {
+		parentContent.Canonical = true
+		parentContent.Via = []string{portal.bridge.Config.Homeserver.Domain}
+		childContent.Via = []string{portal.bridge.Config.Homeserver.Domain}
+		action = "add portal to"
+		portal.log.Debugfln("Adding %s to space %s (%s)", portal.MXID, space.MXID, space.Key.JID)
+	} else {
+		action = "remove portal from"
+		portal.log.Debugfln("Removing %s from space %s (%s)", portal.MXID, space.MXID, space.Key.JID)
+	}
+
+	_, err := space.MainIntent().SendStateEvent(space.MXID, event.StateSpaceChild, portal.MXID.String(), &childContent)
+	if err != nil {
+		portal.log.Errorfln("Failed to send m.space.child event to %s %s: %v", action, space.MXID, err)
+		return false
+	}
+	_, err = portal.MainIntent().SendStateEvent(portal.MXID, event.StateSpaceParent, space.MXID.String(), &parentContent)
+	if err != nil {
+		portal.log.Warnfln("Failed to send m.space.parent event to %s %s: %v", action, space.MXID, err)
+	}
+	portal.InSpace = add
+	if updateInfo {
+		portal.Update(nil)
+		portal.UpdateBridgeInfo()
+	}
+	return true
 }
 
 func (portal *Portal) IsPrivateChat() bool {
@@ -1676,6 +1815,15 @@ func (portal *Portal) GetRelayUser() *User {
 		portal.relayUser = portal.bridge.GetUserByMXID(portal.RelayUserID)
 	}
 	return portal.relayUser
+}
+
+func (portal *Portal) GetParentPortal() *Portal {
+	if portal.ParentGroup.IsEmpty() {
+		return nil
+	} else if portal.parentPortal == nil {
+		portal.parentPortal = portal.bridge.GetPortalByJID(database.NewPortalKey(portal.ParentGroup, portal.ParentGroup))
+	}
+	return portal.parentPortal
 }
 
 func (portal *Portal) MainIntent() *appservice.IntentAPI {
@@ -2091,6 +2239,137 @@ func (portal *Portal) convertListResponseMessage(intent *appservice.IntentAPI, m
 	}
 }
 
+func (portal *Portal) convertPollUpdateMessage(intent *appservice.IntentAPI, source *User, info *types.MessageInfo, msg *waProto.PollUpdateMessage) *ConvertedMessage {
+	if !portal.bridge.Config.Bridge.ExtEvPolls {
+		return nil
+	}
+	pollMessage := portal.bridge.DB.Message.GetByJID(portal.Key, msg.GetPollCreationMessageKey().GetId())
+	if pollMessage == nil {
+		portal.log.Warnfln("Failed to convert vote message %s: poll message %s not found", info.ID, msg.GetPollCreationMessageKey().GetId())
+		return nil
+	}
+	vote, err := source.Client.DecryptPollVote(&events.Message{
+		Info:    *info,
+		Message: &waProto.Message{PollUpdateMessage: msg},
+	})
+	if err != nil {
+		portal.log.Errorfln("Failed to decrypt vote message %s: %v", info.ID, err)
+		return nil
+	}
+	selectedHashes := make([]string, len(vote.GetSelectedOptions()))
+	for i, opt := range vote.GetSelectedOptions() {
+		selectedHashes[i] = hex.EncodeToString(opt)
+	}
+
+	evtType := TypeMSC3881PollResponse
+	//if portal.bridge.Config.Bridge.ExtEvPolls == 2 {
+	//	evtType = TypeMSC3881V2PollResponse
+	//}
+	return &ConvertedMessage{
+		Intent: intent,
+		Type:   evtType,
+		Content: &event.MessageEventContent{
+			RelatesTo: &event.RelatesTo{
+				Type:    event.RelReference,
+				EventID: pollMessage.MXID,
+			},
+		},
+		Extra: map[string]any{
+			"org.matrix.msc3381.poll.response": map[string]any{
+				"answers": selectedHashes,
+			},
+			"org.matrix.msc3381.v2.selections": selectedHashes,
+		},
+	}
+}
+
+func (portal *Portal) convertPollCreationMessage(intent *appservice.IntentAPI, msg *waProto.PollCreationMessage) *ConvertedMessage {
+	optionNames := make([]string, len(msg.GetOptions()))
+	optionsListText := make([]string, len(optionNames))
+	optionsListHTML := make([]string, len(optionNames))
+	msc3381Answers := make([]map[string]any, len(optionNames))
+	msc3381V2Answers := make([]map[string]any, len(optionNames))
+	for i, opt := range msg.GetOptions() {
+		optionNames[i] = opt.GetOptionName()
+		optionsListText[i] = fmt.Sprintf("%d. %s\n", i+1, optionNames[i])
+		optionsListHTML[i] = fmt.Sprintf("<li>%s</li>", event.TextToHTML(optionNames[i]))
+		optionHash := sha256.Sum256([]byte(opt.GetOptionName()))
+		optionHashStr := hex.EncodeToString(optionHash[:])
+		msc3381Answers[i] = map[string]any{
+			"id":                      optionHashStr,
+			"org.matrix.msc1767.text": opt.GetOptionName(),
+		}
+		msc3381V2Answers[i] = map[string]any{
+			"org.matrix.msc3381.v2.id": optionHashStr,
+			"org.matrix.msc1767.markup": []map[string]any{
+				{"mimetype": "text/plain", "body": opt.GetOptionName()},
+			},
+		}
+	}
+	body := fmt.Sprintf("%s\n\n%s", msg.GetName(), strings.Join(optionsListText, "\n"))
+	formattedBody := fmt.Sprintf("<p>%s</p><ol>%s</ol>", event.TextToHTML(msg.GetName()), strings.Join(optionsListHTML, ""))
+	maxChoices := int(msg.GetSelectableOptionsCount())
+	if maxChoices <= 0 {
+		maxChoices = len(optionNames)
+	}
+	evtType := event.EventMessage
+	if portal.bridge.Config.Bridge.ExtEvPolls {
+		evtType.Type = "org.matrix.msc3381.poll.start"
+	}
+	//else if portal.bridge.Config.Bridge.ExtEvPolls == 2 {
+	//	evtType.Type = "org.matrix.msc3381.v2.poll.start"
+	//}
+	return &ConvertedMessage{
+		Intent: intent,
+		Type:   evtType,
+		Content: &event.MessageEventContent{
+			Body:          body,
+			MsgType:       event.MsgText,
+			Format:        event.FormatHTML,
+			FormattedBody: formattedBody,
+		},
+		Extra: map[string]any{
+			// Custom metadata
+			"fi.mau.whatsapp.poll": map[string]any{
+				"option_names":             optionNames,
+				"selectable_options_count": msg.GetSelectableOptionsCount(),
+			},
+
+			// Current extensible events (as of November 2022)
+			"org.matrix.msc1767.markup": []map[string]any{
+				{"mimetype": "text/html", "body": formattedBody},
+				{"mimetype": "text/plain", "body": body},
+			},
+			"org.matrix.msc3381.v2.poll": map[string]any{
+				"kind":           "org.matrix.msc3381.v2.disclosed",
+				"max_selections": maxChoices,
+				"question": map[string]any{
+					"org.matrix.msc1767.markup": []map[string]any{
+						{"mimetype": "text/plain", "body": msg.GetName()},
+					},
+				},
+				"answers": msc3381V2Answers,
+			},
+
+			// Legacy extensible events
+			"org.matrix.msc1767.message": []map[string]any{
+				{"mimetype": "text/html", "body": formattedBody},
+				{"mimetype": "text/plain", "body": body},
+			},
+			"org.matrix.msc3381.poll.start": map[string]any{
+				"kind":           "org.matrix.msc3381.poll.disclosed",
+				"max_selections": maxChoices,
+				"question": map[string]any{
+					"org.matrix.msc1767.text": msg.GetName(),
+				},
+				"answers": msc3381Answers,
+			},
+		},
+		ReplyTo:   GetReply(msg.GetContextInfo()),
+		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+	}
+}
+
 func (portal *Portal) convertLiveLocationMessage(intent *appservice.IntentAPI, msg *waProto.LiveLocationMessage) *ConvertedMessage {
 	content := &event.MessageEventContent{
 		Body:    "Started sharing live location",
@@ -2346,6 +2625,9 @@ func (portal *Portal) HandleWhatsAppInvite(source *User, senderJID *types.JID, j
 }
 
 func (portal *Portal) HandleWhatsAppDeleteChat(user *User) {
+	if portal.MXID == "" {
+		return
+	}
 	matrixUsers, err := portal.GetMatrixUsers()
 	if err != nil {
 		portal.log.Errorln("Failed to get Matrix users to see if DeleteChat should be handled:", err)
@@ -3195,7 +3477,81 @@ func getUnstableWaveform(content map[string]interface{}) []byte {
 	return output
 }
 
+var (
+	TypeMSC3881PollResponse   = event.Type{Class: event.MessageEventType, Type: "org.matrix.msc3381.poll.response"}
+	TypeMSC3881V2PollResponse = event.Type{Class: event.MessageEventType, Type: "org.matrix.msc3881.v2.poll.response"}
+)
+
+type PollResponseContent struct {
+	RelatesTo  event.RelatesTo `json:"m.relates_to"`
+	V1Response struct {
+		Answers []string `json:"answers"`
+	} `json:"org.matrix.msc3381.poll.response"`
+	V2Selections []string `json:"org.matrix.msc3381.v2.selections"`
+}
+
+func (content *PollResponseContent) GetRelatesTo() *event.RelatesTo {
+	return &content.RelatesTo
+}
+
+func (content *PollResponseContent) OptionalGetRelatesTo() *event.RelatesTo {
+	if content.RelatesTo.Type == "" {
+		return nil
+	}
+	return &content.RelatesTo
+}
+
+func (content *PollResponseContent) SetRelatesTo(rel *event.RelatesTo) {
+	content.RelatesTo = *rel
+}
+
+func init() {
+	event.TypeMap[TypeMSC3881PollResponse] = reflect.TypeOf(PollResponseContent{})
+	event.TypeMap[TypeMSC3881V2PollResponse] = reflect.TypeOf(PollResponseContent{})
+}
+
+func (portal *Portal) convertMatrixPollVote(_ context.Context, sender *User, evt *event.Event) (*waProto.Message, *User, error) {
+	content, ok := evt.Content.Parsed.(*PollResponseContent)
+	if !ok {
+		return nil, sender, fmt.Errorf("%w %T", errUnexpectedParsedContentType, evt.Content.Parsed)
+	}
+	var answers []string
+	if content.V1Response.Answers != nil {
+		answers = content.V1Response.Answers
+	} else if content.V2Selections != nil {
+		answers = content.V2Selections
+	}
+	pollMsg := portal.bridge.DB.Message.GetByMXID(content.RelatesTo.EventID)
+	if pollMsg == nil {
+		return nil, sender, errTargetNotFound
+	}
+	pollMsgInfo := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     portal.Key.JID,
+			Sender:   pollMsg.Sender,
+			IsFromMe: pollMsg.Sender.User == sender.JID.User,
+			IsGroup:  portal.IsGroupChat(),
+		},
+		ID:   pollMsg.JID,
+		Type: "poll",
+	}
+	optionHashes := make([][]byte, 0, len(answers))
+	for _, selection := range answers {
+		hash, _ := hex.DecodeString(selection)
+		if hash != nil && len(hash) == 32 {
+			optionHashes = append(optionHashes, hash)
+		}
+	}
+	pollUpdate, err := sender.Client.EncryptPollVote(pollMsgInfo, &waProto.PollVoteMessage{
+		SelectedOptions: optionHashes,
+	})
+	return &waProto.Message{PollUpdateMessage: pollUpdate}, sender, err
+}
+
 func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, evt *event.Event) (*waProto.Message, *User, error) {
+	if evt.Type == TypeMSC3881PollResponse || evt.Type == TypeMSC3881V2PollResponse {
+		return portal.convertMatrixPollVote(ctx, sender, evt)
+	}
 	content, ok := evt.Content.Parsed.(*event.MessageEventContent)
 	if !ok {
 		return nil, sender, fmt.Errorf("%w %T", errUnexpectedParsedContentType, evt.Content.Parsed)
@@ -3213,7 +3569,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 
 	msg := &waProto.Message{}
 	var ctxInfo waProto.ContextInfo
-	replyToID := content.GetReplyTo()
+	replyToID := content.RelatesTo.GetReplyTo()
 	if len(replyToID) > 0 {
 		replyToMsg := portal.bridge.DB.Message.GetByMXID(replyToID)
 		if replyToMsg != nil && !replyToMsg.IsFakeJID() && replyToMsg.Type == database.MsgNormal {
@@ -3432,7 +3788,8 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 	start := time.Now()
 	ms := metricSender{portal: portal, timings: &timings}
 
-	if err := portal.canBridgeFrom(sender, true); err != nil {
+	allowRelay := evt.Type != TypeMSC3881PollResponse && evt.Type != TypeMSC3881V2PollResponse
+	if err := portal.canBridgeFrom(sender, allowRelay); err != nil {
 		go ms.sendMessageMetrics(evt, err, "Ignoring", true)
 		return
 	} else if portal.Key.JID == types.StatusBroadcastJID && portal.bridge.Config.Bridge.DisableStatusBroadcastSend {
@@ -3800,6 +4157,20 @@ func (portal *Portal) canBridgeFrom(sender *User, allowRelay bool) error {
 	return nil
 }
 
+func (portal *Portal) resetChildSpaceStatus() {
+	for _, childPortal := range portal.bridge.portalsByJID {
+		if childPortal.ParentGroup == portal.Key.JID {
+			if portal.MXID != "" && childPortal.InSpace {
+				go childPortal.removeSpaceParentEvent(portal.MXID)
+			}
+			childPortal.InSpace = false
+			if childPortal.parentPortal == portal {
+				childPortal.parentPortal = nil
+			}
+		}
+	}
+}
+
 func (portal *Portal) Delete() {
 	portal.Portal.Delete()
 	portal.bridge.portalsLock.Lock()
@@ -3807,6 +4178,7 @@ func (portal *Portal) Delete() {
 	if len(portal.MXID) > 0 {
 		delete(portal.bridge.portalsByMXID, portal.MXID)
 	}
+	portal.resetChildSpaceStatus()
 	portal.bridge.portalsLock.Unlock()
 }
 

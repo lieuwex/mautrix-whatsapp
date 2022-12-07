@@ -84,8 +84,42 @@ func (user *User) handleHistorySyncsLoop() {
 
 	// Always save the history syncs for the user. If they want to enable
 	// backfilling in the future, we will have it in the database.
-	for evt := range user.historySyncs {
-		user.handleHistorySync(user.BackfillQueue, evt.Data)
+	for {
+		select {
+		case evt := <-user.historySyncs:
+			if evt == nil {
+				return
+			}
+			user.handleHistorySync(user.BackfillQueue, evt.Data)
+		case <-user.enqueueBackfillsTimer.C:
+			user.enqueueAllBackfills()
+		}
+	}
+}
+
+const EnqueueBackfillsDelay = 30 * time.Second
+
+func (user *User) enqueueAllBackfills() {
+	nMostRecent := user.bridge.DB.HistorySync.GetNMostRecentConversations(user.MXID, user.bridge.Config.Bridge.HistorySync.MaxInitialConversations)
+	if len(nMostRecent) > 0 {
+		user.log.Infofln("%v has passed since the last history sync blob, enqueueing backfills for %d chats", EnqueueBackfillsDelay, len(nMostRecent))
+		// Find the portals for all the conversations.
+		portals := []*Portal{}
+		for _, conv := range nMostRecent {
+			jid, err := types.ParseJID(conv.ConversationID)
+			if err != nil {
+				user.log.Warnfln("Failed to parse chat JID '%s' in history sync: %v", conv.ConversationID, err)
+				continue
+			}
+			portals = append(portals, user.GetPortalByJID(jid))
+		}
+
+		user.EnqueueImmediateBackfills(portals)
+		user.EnqueueForwardBackfills(portals)
+		user.EnqueueDeferredBackfills(portals)
+
+		// Tell the queue to check for new backfill requests.
+		user.BackfillQueue.ReCheck()
 	}
 }
 
@@ -232,6 +266,7 @@ func (user *User) backfillInChunks(req *database.Backfill, conv *database.Histor
 		msg.Sent = true
 		msg.Type = database.MsgFake
 		msg.Insert(nil)
+		user.markSelfReadFull(portal)
 		return
 	}
 
@@ -316,7 +351,7 @@ func (user *User) shouldCreatePortalForHistorySync(conv *database.HistorySyncCon
 }
 
 func (user *User) handleHistorySync(backfillQueue *BackfillQueue, evt *waProto.HistorySync) {
-	if evt == nil || evt.SyncType == nil || evt.GetSyncType() == waProto.HistorySync_INITIAL_STATUS_V3 || evt.GetSyncType() == waProto.HistorySync_PUSH_NAME {
+	if evt == nil || evt.SyncType == nil || evt.GetSyncType() == waProto.HistorySync_INITIAL_STATUS_V3 || evt.GetSyncType() == waProto.HistorySync_PUSH_NAME || evt.GetSyncType() == waProto.HistorySync_NON_BLOCKING_DATA {
 		return
 	}
 	description := fmt.Sprintf("type %s, %d conversations, chunk order %d, progress: %d", evt.GetSyncType(), len(evt.GetConversations()), evt.GetChunkOrder(), evt.GetProgress())
@@ -379,36 +414,7 @@ func (user *User) handleHistorySync(backfillQueue *BackfillQueue, evt *waProto.H
 	// most recent portals. If it's the last history sync event, start
 	// backfilling the rest of the history of the portals.
 	if user.bridge.Config.Bridge.HistorySync.Backfill {
-		if evt.GetSyncType() != waProto.HistorySync_INITIAL_BOOTSTRAP && evt.GetProgress() < 98 {
-			return
-		}
-
-		nMostRecent := user.bridge.DB.HistorySync.GetNMostRecentConversations(user.MXID, user.bridge.Config.Bridge.HistorySync.MaxInitialConversations)
-		if len(nMostRecent) > 0 {
-			// Find the portals for all of the conversations.
-			portals := []*Portal{}
-			for _, conv := range nMostRecent {
-				jid, err := types.ParseJID(conv.ConversationID)
-				if err != nil {
-					user.log.Warnfln("Failed to parse chat JID '%s' in history sync: %v", conv.ConversationID, err)
-					continue
-				}
-				portals = append(portals, user.GetPortalByJID(jid))
-			}
-
-			switch evt.GetSyncType() {
-			case waProto.HistorySync_INITIAL_BOOTSTRAP:
-				// Enqueue immediate backfills for the most recent messages first.
-				user.EnqueueImmediateBackfills(portals)
-			case waProto.HistorySync_FULL, waProto.HistorySync_RECENT:
-				user.EnqueueForwardBackfills(portals)
-				// Enqueue deferred backfills as configured.
-				user.EnqueueDeferredBackfills(portals)
-			}
-
-			// Tell the queue to check for new backfill requests.
-			backfillQueue.ReCheck()
-		}
+		user.enqueueBackfillsTimer.Reset(EnqueueBackfillsDelay)
 	}
 }
 
@@ -736,10 +742,12 @@ func (portal *Portal) wrapBatchReaction(source *User, reaction *waProto.Reaction
 	if rawTS := reaction.GetSenderTimestampMs(); rawTS >= mainEventTS.UnixMilli() && rawTS <= time.Now().UnixMilli() {
 		reactionInfo.Timestamp = time.UnixMilli(rawTS)
 	}
+	wrappedContent := event.Content{Parsed: &content}
+	intent.AddDoublePuppetValue(&wrappedContent)
 	reactionEvent = &event.Event{
 		ID:        portal.deterministicEventID(senderJID, reactionInfo.ID, ""),
 		Type:      event.EventReaction,
-		Content:   event.Content{Parsed: content},
+		Content:   wrappedContent,
 		Sender:    intent.UserID,
 		Timestamp: reactionInfo.Timestamp.UnixMilli(),
 	}
@@ -755,9 +763,7 @@ func (portal *Portal) wrapBatchEvent(info *types.MessageInfo, intent *appservice
 	if err != nil {
 		return nil, err
 	}
-	if newEventType != eventType {
-		intent.AddDoublePuppetValue(&wrappedContent)
-	}
+	intent.AddDoublePuppetValue(&wrappedContent)
 	var eventID id.EventID
 	if portal.bridge.Config.Homeserver.Software == bridgeconfig.SoftwareHungry {
 		eventID = portal.deterministicEventID(info.Sender, info.ID, partName)
