@@ -87,8 +87,9 @@ func (br *WABridge) Init() {
 
 	// TODO this is a weird place for this
 	br.EventProcessor.On(event.EphemeralEventPresence, br.HandlePresence)
-	br.EventProcessor.On(TypeMSC3881PollResponse, br.MatrixHandler.HandleMessage)
-	br.EventProcessor.On(TypeMSC3881V2PollResponse, br.MatrixHandler.HandleMessage)
+	br.EventProcessor.On(TypeMSC3381PollStart, br.MatrixHandler.HandleMessage)
+	br.EventProcessor.On(TypeMSC3381PollResponse, br.MatrixHandler.HandleMessage)
+	br.EventProcessor.On(TypeMSC3381V2PollResponse, br.MatrixHandler.HandleMessage)
 
 	Segment.log = br.Log.Sub("Segment")
 	Segment.key = br.Config.SegmentKey
@@ -264,7 +265,7 @@ func main() {
 		Name:         "mautrix-whatsapp",
 		URL:          "https://github.com/mautrix/whatsapp",
 		Description:  "A Matrix-WhatsApp puppeting bridge.",
-		Version:      "0.7.2",
+		Version:      "0.8.0",
 		ProtocolName: "WhatsApp",
 
 		CryptoPickleKey: "maunium.net/go/mautrix-whatsapp",
