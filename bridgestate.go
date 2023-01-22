@@ -33,6 +33,7 @@ const (
 	WAKeepaliveTimeout status.BridgeStateErrorCode = "wa-keepalive-timeout"
 	WAPhoneOffline     status.BridgeStateErrorCode = "wa-phone-offline"
 	WAConnectionFailed status.BridgeStateErrorCode = "wa-connection-failed"
+	WADisconnected     status.BridgeStateErrorCode = "wa-transient-disconnect"
 )
 
 func init() {
@@ -45,6 +46,7 @@ func init() {
 		WAKeepaliveTimeout: "The WhatsApp web servers are not responding. The bridge will try to reconnect.",
 		WAPhoneOffline:     "Your phone hasn't been seen in over 12 days. The bridge is currently connected, but will get disconnected if you don't open the app soon.",
 		WAConnectionFailed: "Connecting to the WhatsApp web servers failed.",
+		WADisconnected:     "Disconnected from WhatsApp. Trying to reconnect.",
 	})
 }
 
@@ -52,7 +54,7 @@ func (user *User) GetRemoteID() string {
 	if user == nil || user.JID.IsEmpty() {
 		return ""
 	}
-	return fmt.Sprintf("%s_a%d_d%d", user.JID.User, user.JID.Agent, user.JID.Device)
+	return user.JID.User
 }
 
 func (user *User) GetRemoteName() string {

@@ -114,6 +114,13 @@ func (br *WABridge) Init() {
 	store.BaseClientPayload.UserAgent.OsBuildNumber = proto.String(br.WAVersion)
 	store.DeviceProps.Os = proto.String(br.Config.WhatsApp.OSName)
 	store.DeviceProps.RequireFullSync = proto.Bool(br.Config.Bridge.HistorySync.RequestFullSync)
+	if fsc := br.Config.Bridge.HistorySync.FullSyncConfig; fsc.DaysLimit > 0 && fsc.SizeLimit > 0 && fsc.StorageQuota > 0 {
+		store.DeviceProps.HistorySyncConfig = &waProto.DeviceProps_HistorySyncConfig{
+			FullSyncDaysLimit:   proto.Uint32(fsc.DaysLimit),
+			FullSyncSizeMbLimit: proto.Uint32(fsc.SizeLimit),
+			StorageQuotaMb:      proto.Uint32(fsc.StorageQuota),
+		}
+	}
 	versionParts := strings.Split(br.WAVersion, ".")
 	if len(versionParts) > 2 {
 		primary, _ := strconv.Atoi(versionParts[0])
@@ -265,7 +272,7 @@ func main() {
 		Name:         "mautrix-whatsapp",
 		URL:          "https://github.com/mautrix/whatsapp",
 		Description:  "A Matrix-WhatsApp puppeting bridge.",
-		Version:      "0.8.0",
+		Version:      "0.8.1",
 		ProtocolName: "WhatsApp",
 
 		CryptoPickleKey: "maunium.net/go/mautrix-whatsapp",

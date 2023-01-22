@@ -268,6 +268,8 @@ type Portal struct {
 
 	mediaErrorCache map[types.MessageID]*FailedMediaMeta
 
+	currentlySleepingToDelete sync.Map
+
 	relayUser    *User
 	parentPortal *Portal
 }
@@ -278,7 +280,6 @@ var (
 	_ bridge.MembershipHandlingPortal  = (*Portal)(nil)
 	_ bridge.MetaHandlingPortal        = (*Portal)(nil)
 	_ bridge.TypingPortal              = (*Portal)(nil)
-	_ bridge.DisappearingPortal        = (*Portal)(nil)
 )
 
 func (portal *Portal) handleMessageLoopItem(msg PortalMessage) {
@@ -613,13 +614,8 @@ func (portal *Portal) UpdateGroupDisappearingMessages(sender *types.JID, timesta
 func (portal *Portal) formatDisappearingMessageNotice() string {
 	if portal.ExpirationTime == 0 {
 		return "Turned off disappearing messages"
-	} else {
-		msg := fmt.Sprintf("Set the disappearing message timer to %s", formatDuration(time.Duration(portal.ExpirationTime)*time.Second))
-		if !portal.bridge.Config.Bridge.DisappearingMessagesInGroups && portal.IsGroupChat() {
-			msg += ". However, this bridge is not configured to disappear messages in group chats."
-		}
-		return msg
 	}
+	return fmt.Sprintf("Set the disappearing message timer to %s", formatDuration(time.Duration(portal.ExpirationTime)*time.Second))
 }
 
 const UndecryptableMessageNotice = "Decrypting message from WhatsApp failed, waiting for sender to re-send... " +
@@ -651,11 +647,8 @@ func (portal *Portal) handleUndecryptableMessage(source *User, evt *events.Undec
 		"messageID":         evt.Info.ID,
 		"undecryptableType": metricType,
 	})
-	intent := portal.getMessageIntent(source, &evt.Info)
+	intent := portal.getMessageIntent(source, &evt.Info, "undecryptable")
 	if intent == nil {
-		return
-	} else if !intent.IsCustomPuppet && portal.IsPrivateChat() && evt.Info.Sender.User == portal.Key.Receiver.User {
-		portal.log.Debugfln("Not handling %s (undecryptable): user doesn't have double puppeting enabled", evt.Info.ID)
 		return
 	}
 	content := undecryptableMessageContent
@@ -676,7 +669,7 @@ func (portal *Portal) handleFakeMessage(msg fakeMessage) {
 		return
 	}
 	intent := portal.bridge.GetPuppetByJID(msg.Sender).IntentFor(portal)
-	if !intent.IsCustomPuppet && portal.IsPrivateChat() && msg.Sender.User == portal.Key.Receiver.User {
+	if !intent.IsCustomPuppet && portal.IsPrivateChat() && msg.Sender.User == portal.Key.Receiver.User && portal.Key.Receiver != portal.Key.JID {
 		portal.log.Debugfln("Not handling %s (fake): user doesn't have double puppeting enabled", msg.ID)
 		return
 	}
@@ -743,11 +736,8 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		evt.Message = evt.Message.GetProtocolMessage().GetEditedMessage()
 	}
 
-	intent := portal.getMessageIntent(source, &evt.Info)
+	intent := portal.getMessageIntent(source, &evt.Info, msgType)
 	if intent == nil {
-		return
-	} else if !intent.IsCustomPuppet && portal.IsPrivateChat() && evt.Info.Sender.User == portal.Key.Receiver.User {
-		portal.log.Debugfln("Not handling %s (%s): user doesn't have double puppeting enabled", msgID, msgType)
 		return
 	}
 	converted := portal.convertMessage(intent, source, &evt.Info, evt.Message, false)
@@ -764,7 +754,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 		var eventID id.EventID
 		var lastEventID id.EventID
 		if existingMsg != nil {
-			portal.MarkDisappearing(nil, existingMsg.MXID, converted.ExpiresIn, false)
+			portal.MarkDisappearing(nil, existingMsg.MXID, converted.ExpiresIn, evt.Info.Timestamp)
 			converted.Content.SetEdit(existingMsg.MXID)
 		} else if converted.ReplyTo != nil {
 			portal.SetReply(converted.Content, converted.ReplyTo, false)
@@ -779,7 +769,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			portal.log.Errorfln("Failed to send %s to Matrix: %v", msgID, err)
 		} else {
 			if editTargetMsg == nil {
-				portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, false)
+				portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, evt.Info.Timestamp)
 			}
 			eventID = resp.EventID
 			lastEventID = eventID
@@ -790,7 +780,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 			if err != nil {
 				portal.log.Errorfln("Failed to send caption of %s to Matrix: %v", msgID, err)
 			} else {
-				portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, false)
+				portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, evt.Info.Timestamp)
 				lastEventID = resp.EventID
 			}
 		}
@@ -800,7 +790,7 @@ func (portal *Portal) handleMessage(source *User, evt *events.Message) {
 				if err != nil {
 					portal.log.Errorfln("Failed to send sub-event %d of %s to Matrix: %v", index+1, msgID, err)
 				} else {
-					portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, false)
+					portal.MarkDisappearing(nil, resp.EventID, converted.ExpiresIn, evt.Info.Timestamp)
 					lastEventID = resp.EventID
 				}
 			}
@@ -906,12 +896,17 @@ func (portal *Portal) getMessagePuppet(user *User, info *types.MessageInfo) (pup
 	return puppet
 }
 
-func (portal *Portal) getMessageIntent(user *User, info *types.MessageInfo) *appservice.IntentAPI {
+func (portal *Portal) getMessageIntent(user *User, info *types.MessageInfo, msgType string) *appservice.IntentAPI {
 	puppet := portal.getMessagePuppet(user, info)
 	if puppet == nil {
 		return nil
 	}
-	return puppet.IntentFor(portal)
+	intent := puppet.IntentFor(portal)
+	if !intent.IsCustomPuppet && portal.IsPrivateChat() && info.Sender.User == portal.Key.Receiver.User && portal.Key.Receiver != portal.Key.JID {
+		portal.log.Debugfln("Not handling %s (%s): user doesn't have double puppeting enabled", info.ID, msgType)
+		return nil
+	}
+	return intent
 }
 
 func (portal *Portal) finishHandling(existing *database.Message, message *types.MessageInfo, mxid id.EventID, msgType database.MessageType, errType database.MessageErrorType) {
@@ -1330,11 +1325,12 @@ func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
 			portal.MainIntent().UserID: 100,
 		},
 		Events: map[string]int{
-			event.StateRoomName.Type:   anyone,
-			event.StateRoomAvatar.Type: anyone,
-			event.StateTopic.Type:      anyone,
-			event.EventReaction.Type:   anyone,
-			event.EventRedaction.Type:  anyone,
+			event.StateRoomName.Type:     anyone,
+			event.StateRoomAvatar.Type:   anyone,
+			event.StateTopic.Type:        anyone,
+			event.EventReaction.Type:     anyone,
+			event.EventRedaction.Type:    anyone,
+			TypeMSC3381PollResponse.Type: anyone,
 		},
 	}
 }
@@ -1343,6 +1339,7 @@ func (portal *Portal) applyPowerLevelFixes(levels *event.PowerLevelsEventContent
 	changed := false
 	changed = levels.EnsureEventLevel(event.EventReaction, 0) || changed
 	changed = levels.EnsureEventLevel(event.EventRedaction, 0) || changed
+	changed = levels.EnsureEventLevel(TypeMSC3381PollResponse, 0) || changed
 	return changed
 }
 
@@ -2052,7 +2049,7 @@ type ConvertedMessage struct {
 	MultiEvent []*event.MessageEventContent
 
 	ReplyTo   *ReplyInfo
-	ExpiresIn uint32
+	ExpiresIn time.Duration
 	Error     database.MessageErrorType
 	MediaKey  []byte
 }
@@ -2085,7 +2082,7 @@ func (portal *Portal) convertTextMessage(intent *appservice.IntentAPI, source *U
 
 	contextInfo := msg.GetExtendedTextMessage().GetContextInfo()
 	portal.bridge.Formatter.ParseWhatsApp(portal.MXID, content, contextInfo.GetMentionedJid(), false, false)
-	expiresIn := contextInfo.GetExpiration()
+	expiresIn := time.Duration(contextInfo.GetExpiration()) * time.Second
 	extraAttrs := map[string]interface{}{}
 	extraAttrs["com.beeper.linkpreviews"] = portal.convertURLPreviewToBeeper(intent, source, msg.GetExtendedTextMessage())
 
@@ -2108,7 +2105,7 @@ func (portal *Portal) convertTemplateMessage(intent *appservice.IntentAPI, sourc
 			MsgType: event.MsgText,
 		},
 		ReplyTo:   GetReply(tplMsg.GetContextInfo()),
-		ExpiresIn: tplMsg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(tplMsg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 
 	tpl := tplMsg.GetHydratedTemplate()
@@ -2185,7 +2182,7 @@ func (portal *Portal) convertTemplateButtonReplyMessage(intent *appservice.Inten
 			},
 		},
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 }
 
@@ -2198,7 +2195,7 @@ func (portal *Portal) convertListMessage(intent *appservice.IntentAPI, source *U
 			MsgType: event.MsgText,
 		},
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 	body := msg.GetDescription()
 	if msg.GetTitle() != "" {
@@ -2265,7 +2262,7 @@ func (portal *Portal) convertListResponseMessage(intent *appservice.IntentAPI, m
 			},
 		},
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 }
 
@@ -2408,7 +2405,7 @@ func (portal *Portal) convertPollCreationMessage(intent *appservice.IntentAPI, m
 			},
 		},
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 }
 
@@ -2425,7 +2422,7 @@ func (portal *Portal) convertLiveLocationMessage(intent *appservice.IntentAPI, m
 		Type:      event.EventMessage,
 		Content:   content,
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 }
 
@@ -2477,7 +2474,7 @@ func (portal *Portal) convertLocationMessage(intent *appservice.IntentAPI, msg *
 		Type:      event.EventMessage,
 		Content:   content,
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 }
 
@@ -2519,7 +2516,7 @@ func (portal *Portal) convertGroupInviteMessage(intent *appservice.IntentAPI, in
 		Content:   content,
 		Extra:     extraAttrs,
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 }
 
@@ -2555,7 +2552,7 @@ func (portal *Portal) convertContactMessage(intent *appservice.IntentAPI, msg *w
 		Type:      event.EventMessage,
 		Content:   content,
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 	}
 }
 
@@ -2579,7 +2576,7 @@ func (portal *Portal) convertContactsArrayMessage(intent *appservice.IntentAPI, 
 			Body:    fmt.Sprintf("Sent %s", name),
 		},
 		ReplyTo:    GetReply(msg.GetContextInfo()),
-		ExpiresIn:  msg.GetContextInfo().GetExpiration(),
+		ExpiresIn:  time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 		MultiEvent: contacts,
 	}
 }
@@ -2938,7 +2935,7 @@ func (portal *Portal) convertMediaMessageContent(intent *appservice.IntentAPI, m
 		Content:   content,
 		Caption:   captionContent,
 		ReplyTo:   GetReply(msg.GetContextInfo()),
-		ExpiresIn: msg.GetContextInfo().GetExpiration(),
+		ExpiresIn: time.Duration(msg.GetContextInfo().GetExpiration()) * time.Second,
 		Extra:     extraContent,
 	}
 }
@@ -3728,6 +3725,7 @@ func (portal *Portal) generateContextInfo(relatesTo *event.RelatesTo) *waProto.C
 
 type extraConvertMeta struct {
 	PollOptions map[[32]byte]string
+	EditRootMsg *database.Message
 }
 
 func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, evt *event.Event) (*waProto.Message, *User, *extraConvertMeta, error) {
@@ -3740,12 +3738,14 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	if !ok {
 		return nil, sender, nil, fmt.Errorf("%w %T", errUnexpectedParsedContentType, evt.Content.Parsed)
 	}
+	extraMeta := &extraConvertMeta{}
 	var editRootMsg *database.Message
 	if editEventID := content.RelatesTo.GetReplaceID(); editEventID != "" && portal.bridge.Config.Bridge.SendWhatsAppEdits {
 		editRootMsg = portal.bridge.DB.Message.GetByMXID(editEventID)
 		if editRootMsg == nil || editRootMsg.Type != database.MsgNormal || editRootMsg.IsFakeJID() || editRootMsg.Sender.User != sender.JID.User {
-			return nil, sender, nil, fmt.Errorf("edit rejected") // TODO more specific error message
+			return nil, sender, extraMeta, fmt.Errorf("edit rejected") // TODO more specific error message
 		}
+		extraMeta.EditRootMsg = editRootMsg
 		if content.NewContent != nil {
 			content = content.NewContent
 		}
@@ -3756,7 +3756,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	relaybotFormatted := false
 	if !sender.IsLoggedIn() || (portal.IsPrivateChat() && sender.JID.User != portal.Key.Receiver.User) {
 		if !portal.HasRelaybot() {
-			return nil, sender, nil, errUserNotLoggedIn
+			return nil, sender, extraMeta, errUserNotLoggedIn
 		}
 		relaybotFormatted = portal.addRelaybotFormat(sender, content)
 		sender = portal.GetRelayUser()
@@ -3777,7 +3777,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	case event.MsgText, event.MsgEmote, event.MsgNotice:
 		text := content.Body
 		if content.MsgType == event.MsgNotice && !portal.bridge.Config.Bridge.BridgeNotices {
-			return nil, sender, nil, errMNoticeDisabled
+			return nil, sender, extraMeta, errMNoticeDisabled
 		}
 		if content.Format == event.FormatHTML {
 			text, ctxInfo.MentionedJid = portal.bridge.Formatter.ParseMatrix(content.FormattedBody)
@@ -3791,7 +3791,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		}
 		hasPreview := portal.convertURLPreviewToWhatsApp(ctx, sender, evt, msg.ExtendedTextMessage)
 		if ctx.Err() != nil {
-			return nil, nil, nil, ctx.Err()
+			return nil, sender, extraMeta, ctx.Err()
 		}
 		if ctxInfo.StanzaId == nil && ctxInfo.MentionedJid == nil && ctxInfo.Expiration == nil && !hasPreview {
 			// No need for extended message
@@ -3801,7 +3801,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	case event.MsgImage:
 		media, err := portal.preprocessMatrixMedia(ctx, sender, relaybotFormatted, content, evt.ID, whatsmeow.MediaImage)
 		if media == nil {
-			return nil, sender, nil, err
+			return nil, sender, extraMeta, err
 		}
 		ctxInfo.MentionedJid = media.MentionedJIDs
 		msg.ImageMessage = &waProto.ImageMessage{
@@ -3818,7 +3818,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	case event.MessageType(event.EventSticker.Type):
 		media, err := portal.preprocessMatrixMedia(ctx, sender, relaybotFormatted, content, evt.ID, whatsmeow.MediaImage)
 		if media == nil {
-			return nil, sender, nil, err
+			return nil, sender, extraMeta, err
 		}
 		ctxInfo.MentionedJid = media.MentionedJIDs
 		msg.StickerMessage = &waProto.StickerMessage{
@@ -3835,7 +3835,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		gifPlayback := content.GetInfo().MimeType == "image/gif"
 		media, err := portal.preprocessMatrixMedia(ctx, sender, relaybotFormatted, content, evt.ID, whatsmeow.MediaVideo)
 		if media == nil {
-			return nil, sender, nil, err
+			return nil, sender, extraMeta, err
 		}
 		duration := uint32(content.GetInfo().Duration / 1000)
 		ctxInfo.MentionedJid = media.MentionedJIDs
@@ -3855,7 +3855,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	case event.MsgAudio:
 		media, err := portal.preprocessMatrixMedia(ctx, sender, relaybotFormatted, content, evt.ID, whatsmeow.MediaAudio)
 		if media == nil {
-			return nil, sender, nil, err
+			return nil, sender, extraMeta, err
 		}
 		duration := uint32(content.GetInfo().Duration / 1000)
 		msg.AudioMessage = &waProto.AudioMessage{
@@ -3878,7 +3878,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	case event.MsgFile:
 		media, err := portal.preprocessMatrixMedia(ctx, sender, relaybotFormatted, content, evt.ID, whatsmeow.MediaDocument)
 		if media == nil {
-			return nil, sender, nil, err
+			return nil, sender, extraMeta, err
 		}
 		msg.DocumentMessage = &waProto.DocumentMessage{
 			ContextInfo:   ctxInfo,
@@ -3904,7 +3904,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 	case event.MsgLocation:
 		lat, long, err := parseGeoURI(content.GeoURI)
 		if err != nil {
-			return nil, sender, nil, fmt.Errorf("%w: %v", errInvalidGeoURI, err)
+			return nil, sender, extraMeta, fmt.Errorf("%w: %v", errInvalidGeoURI, err)
 		}
 		msg.LocationMessage = &waProto.LocationMessage{
 			DegreesLatitude:  &lat,
@@ -3913,7 +3913,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 			ContextInfo:      ctxInfo,
 		}
 	default:
-		return nil, sender, nil, fmt.Errorf("%w %q", errUnknownMsgType, content.MsgType)
+		return nil, sender, extraMeta, fmt.Errorf("%w %q", errUnknownMsgType, content.MsgType)
 	}
 
 	if editRootMsg != nil {
@@ -3935,7 +3935,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		}
 	}
 
-	return msg, sender, nil, nil
+	return msg, sender, extraMeta, nil
 }
 
 func (portal *Portal) generateMessageInfo(sender *User) *types.MessageInfo {
@@ -4025,7 +4025,7 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 	if msg.PollCreationMessage != nil || msg.PollCreationMessageV2 != nil {
 		dbMsgType = database.MsgMatrixPoll
 	} else if msg.EditedMessage == nil {
-		portal.MarkDisappearing(nil, origEvtID, portal.ExpirationTime, true)
+		portal.MarkDisappearing(nil, origEvtID, time.Duration(portal.ExpirationTime)*time.Second, time.Now())
 	} else {
 		dbMsgType = database.MsgEdit
 	}
@@ -4258,9 +4258,6 @@ func (portal *Portal) handleMatrixReadReceipt(sender *User, eventID id.EventID, 
 			portal.log.Warnfln("Failed to mark %v as read by %s: %v", ids, sender.JID, err)
 		}
 	}
-	if isExplicit {
-		portal.ScheduleDisappearing()
-	}
 }
 
 func typingDiff(prev, new []id.UserID) (started, stopped []id.UserID) {
@@ -4388,6 +4385,13 @@ func (portal *Portal) Cleanup(puppetsOnly bool) {
 		return
 	}
 	intent := portal.MainIntent()
+	if portal.bridge.SpecVersions.UnstableFeatures["com.beeper.room_yeeting"] {
+		err := intent.BeeperDeleteRoom(portal.MXID)
+		if err == nil || errors.Is(err, mautrix.MNotFound) {
+			return
+		}
+		portal.log.Warnfln("Failed to delete %s using hungryserv yeet endpoint, falling back to normal behavior: %v", portal.MXID, err)
+	}
 	members, err := intent.JoinedMembers(portal.MXID)
 	if err != nil {
 		portal.log.Errorln("Failed to get portal members for cleanup:", err)

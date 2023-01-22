@@ -1,6 +1,9 @@
-# unreleased
+# v0.8.1 (2023-01-16)
 
 * Added support for sending polls from Matrix to WhatsApp.
+* Added config option for requesting more history from phone during login.
+* Added support for WhatsApp chat with yourself.
+* Fixed deleting portals not working correctly in some cases.
 
 # v0.8.0 (2022-12-16)
 
