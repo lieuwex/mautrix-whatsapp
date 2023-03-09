@@ -1,3 +1,20 @@
+# unreleased
+
+* Bumped minimum Go version to 1.19.
+* Switched to zerolog for logging.
+  * The basic log config will be migrated automatically, but you may want to
+    tweak it as the options are different.
+
+# v0.8.2 (2023-02-16)
+
+* Updated portal room power levels to always allow poll votes.
+* Fixed disappearing message timing being implemented incorrectly.
+* Fixed server rejecting messages not being handled as an error.
+* Fixed sent files not being downloadable on latest WhatsApp beta versions.
+* Fixed `sync space` command not syncing DMs into the space properly.
+* Added workaround for broken clients like Element iOS that can't render normal
+  image messages correctly.
+
 # v0.8.1 (2023-01-16)
 
 * Added support for sending polls from Matrix to WhatsApp.
