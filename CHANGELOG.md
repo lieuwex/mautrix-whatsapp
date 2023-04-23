@@ -1,9 +1,23 @@
-# unreleased
+# v0.8.4 (2023-04-16)
+
+* Enabled sending edits to WhatsApp by default.
+* Added options to automatically ratchet/delete megolm sessions to minimize
+  access to old messages.
+* Added automatic media re-requesting when download fails with 403 error.
+* Added option to not set room name/avatar even in encrypted rooms.
+
+# v0.8.3 (2023-03-16)
 
 * Bumped minimum Go version to 1.19.
 * Switched to zerolog for logging.
   * The basic log config will be migrated automatically, but you may want to
     tweak it as the options are different.
+* Implemented [MSC3952]: Intentional Mentions
+  (currently only for incoming messages).
+* Implemented [MSC2659]: Application service ping endpoint.
+
+[MSC3952]: https://github.com/matrix-org/matrix-spec-proposals/pull/3952
+[MSC2659]: https://github.com/matrix-org/matrix-spec-proposals/pull/2659
 
 # v0.8.2 (2023-02-16)
 
