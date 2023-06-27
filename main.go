@@ -33,7 +33,6 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 
-	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridge"
 	"maunium.net/go/mautrix/bridge/commands"
 	"maunium.net/go/mautrix/bridge/status"
@@ -151,7 +150,7 @@ func (br *WABridge) Start() {
 		br.Provisioning.Init()
 	}
 	go br.CheckWhatsAppUpdate()
-	go br.UpdatePuppetContactInfo()
+	br.WaitWebsocketConnected()
 	go br.StartUsers()
 	if br.Config.Metrics.Enabled {
 		go br.Metrics.Start()
@@ -179,14 +178,6 @@ func (br *WABridge) CheckWhatsAppUpdate() {
 		}
 	} else {
 		br.Log.Debugfln("Bridge is using newer than latest WhatsApp web protocol")
-	}
-}
-
-func (br *WABridge) UpdatePuppetContactInfo() {
-	for _, puppet := range br.GetAllPuppets() {
-		if puppet.UpdateContactInfo() {
-			puppet.Update()
-		}
 	}
 }
 
@@ -256,20 +247,6 @@ func (br *WABridge) GetConfigPtr() interface{} {
 	return br.Config
 }
 
-const unstableFeatureBatchSending = "org.matrix.msc2716"
-
-func (br *WABridge) CheckFeatures(versions *mautrix.RespVersions) (string, bool) {
-	if br.Config.Bridge.HistorySync.Backfill {
-		supported, known := versions.UnstableFeatures[unstableFeatureBatchSending]
-		if !known {
-			return "Backfilling is enabled in bridge config, but homeserver does not support MSC2716 batch sending", false
-		} else if !supported {
-			return "Backfilling is enabled in bridge config, but MSC2716 batch sending is not enabled on homeserver", false
-		}
-	}
-	return "", true
-}
-
 func main() {
 	br := &WABridge{
 		usersByMXID:         make(map[id.UserID]*User),
@@ -285,7 +262,7 @@ func main() {
 		Name:              "mautrix-whatsapp",
 		URL:               "https://github.com/mautrix/whatsapp",
 		Description:       "A Matrix-WhatsApp puppeting bridge.",
-		Version:           "0.8.5",
+		Version:           "0.8.6",
 		ProtocolName:      "WhatsApp",
 		BeeperServiceName: "whatsapp",
 		BeeperNetworkName: "whatsapp",

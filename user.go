@@ -95,7 +95,9 @@ type User struct {
 	resyncQueueLock sync.Mutex
 	nextResync      time.Time
 
-	createKeyDedup string
+	createKeyDedup       string
+	skipGroupCreateDelay types.JID
+	groupJoinLock        sync.Mutex
 }
 
 type resyncQueueItem struct {
@@ -842,13 +844,16 @@ func (user *User) HandleEvent(event interface{}) {
 	case *events.ConnectFailure:
 		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Message: fmt.Sprintf("Unknown connection failure: %s", v.Reason)})
 		user.bridge.Metrics.TrackConnectionState(user.JID, false)
+		user.bridge.Metrics.TrackConnectionFailure(fmt.Sprintf("status-%d", v.Reason))
 	case *events.ClientOutdated:
 		user.log.Errorfln("Got a client outdated connect failure. The bridge is likely out of date, please update immediately.")
 		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateUnknownError, Message: "Connect failure: 405 client outdated"})
 		user.bridge.Metrics.TrackConnectionState(user.JID, false)
+		user.bridge.Metrics.TrackConnectionFailure("client-outdated")
 	case *events.TemporaryBan:
 		user.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Message: v.String()})
 		user.bridge.Metrics.TrackConnectionState(user.JID, false)
+		user.bridge.Metrics.TrackConnectionFailure("temporary-ban")
 	case *events.Disconnected:
 		// Don't send the normal transient disconnect state if we're already in a different transient disconnect state.
 		// TODO remove this if/when the phone offline state is moved to a sub-state of CONNECTED
@@ -1304,8 +1309,12 @@ func (user *User) markUnread(portal *Portal, unread bool) {
 
 func (user *User) handleGroupCreate(evt *events.JoinedGroup) {
 	portal := user.GetPortalByJID(evt.JID)
+	if evt.CreateKey == "" && len(portal.MXID) == 0 && portal.Key.JID != user.skipGroupCreateDelay {
+		user.log.Debugfln("Delaying handling group create with empty key to avoid race conditions")
+		time.Sleep(5 * time.Second)
+	}
 	if len(portal.MXID) == 0 {
-		if evt.CreateKey == user.createKeyDedup {
+		if user.createKeyDedup != "" && evt.CreateKey == user.createKeyDedup {
 			user.log.Debugfln("Ignoring group create event with key %s", evt.CreateKey)
 			return
 		}

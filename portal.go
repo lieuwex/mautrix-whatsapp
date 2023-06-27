@@ -440,7 +440,7 @@ func getMessageType(waMsg *waProto.Message) string {
 		return "reaction"
 	case waMsg.EncReactionMessage != nil:
 		return "encrypted reaction"
-	case waMsg.PollCreationMessage != nil || waMsg.PollCreationMessageV2 != nil:
+	case waMsg.PollCreationMessage != nil || waMsg.PollCreationMessageV2 != nil || waMsg.PollCreationMessageV3 != nil:
 		return "poll create"
 	case waMsg.PollUpdateMessage != nil:
 		return "poll update"
@@ -561,6 +561,8 @@ func (portal *Portal) convertMessage(intent *appservice.IntentAPI, source *User,
 		return portal.convertPollCreationMessage(intent, waMsg.GetPollCreationMessage())
 	case waMsg.PollCreationMessageV2 != nil:
 		return portal.convertPollCreationMessage(intent, waMsg.GetPollCreationMessageV2())
+	case waMsg.PollCreationMessageV3 != nil:
+		return portal.convertPollCreationMessage(intent, waMsg.GetPollCreationMessageV3())
 	case waMsg.PollUpdateMessage != nil:
 		return portal.convertPollUpdateMessage(intent, source, info, waMsg.GetPollUpdateMessage())
 	case waMsg.ImageMessage != nil:
@@ -1665,7 +1667,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 			},
 		})
 	}
-	autoJoinInvites := portal.bridge.Config.Homeserver.Software == bridgeconfig.SoftwareHungry
+	autoJoinInvites := portal.bridge.SpecVersions.Supports(mautrix.BeeperFeatureAutojoinInvites)
 	if autoJoinInvites {
 		portal.log.Debugfln("Hungryserv mode: adding all group members in create request")
 		if groupInfo != nil {
@@ -1694,6 +1696,16 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	}
 	if !portal.shouldSetDMRoomMetadata() {
 		req.Name = ""
+	}
+	legacyBackfill := user.bridge.Config.Bridge.HistorySync.Backfill && backfill && !user.bridge.SpecVersions.Supports(mautrix.BeeperFeatureBatchSending)
+	var backfillStarted bool
+	if legacyBackfill {
+		portal.latestEventBackfillLock.Lock()
+		defer func() {
+			if !backfillStarted {
+				portal.latestEventBackfillLock.Unlock()
+			}
+		}()
 	}
 	resp, err := intent.CreateRoom(req)
 	if err != nil {
@@ -1756,10 +1768,15 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, i
 	}
 
 	if user.bridge.Config.Bridge.HistorySync.Backfill && backfill {
-		portals := []*Portal{portal}
-		user.EnqueueImmediateBackfills(portals)
-		user.EnqueueDeferredBackfills(portals)
-		user.BackfillQueue.ReCheck()
+		if legacyBackfill {
+			backfillStarted = true
+			go portal.legacyBackfill(user)
+		} else {
+			portals := []*Portal{portal}
+			user.EnqueueImmediateBackfills(portals)
+			user.EnqueueDeferredBackfills(portals)
+			user.BackfillQueue.ReCheck()
+		}
 	}
 	return nil
 }
@@ -1899,7 +1916,7 @@ func (portal *Portal) addReplyMention(content *event.MessageEventContent, sender
 	}
 }
 
-func (portal *Portal) SetReply(content *event.MessageEventContent, replyTo *ReplyInfo, isBackfill bool) bool {
+func (portal *Portal) SetReply(content *event.MessageEventContent, replyTo *ReplyInfo, isHungryBackfill bool) bool {
 	if replyTo == nil {
 		return false
 	}
@@ -1925,7 +1942,7 @@ func (portal *Portal) SetReply(content *event.MessageEventContent, replyTo *Repl
 	}
 	message := portal.bridge.DB.Message.GetByJID(key, replyTo.MessageID)
 	if message == nil || message.IsFakeMXID() {
-		if isBackfill && portal.bridge.Config.Homeserver.Software == bridgeconfig.SoftwareHungry {
+		if isHungryBackfill {
 			content.RelatesTo = (&event.RelatesTo{}).SetReplyTo(targetPortal.deterministicEventID(replyTo.Sender, replyTo.MessageID, ""))
 			portal.addReplyMention(content, replyTo.Sender, "")
 			return true
@@ -3018,7 +3035,7 @@ func (portal *Portal) uploadMedia(intent *appservice.IntentAPI, data []byte, con
 	}
 	var mxc id.ContentURI
 	if portal.bridge.Config.Homeserver.AsyncMedia {
-		uploaded, err := intent.UnstableUploadAsync(req)
+		uploaded, err := intent.UploadAsync(req)
 		if err != nil {
 			return err
 		}
@@ -4128,7 +4145,7 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 		return
 	}
 	dbMsgType := database.MsgNormal
-	if msg.PollCreationMessage != nil || msg.PollCreationMessageV2 != nil {
+	if msg.PollCreationMessage != nil || msg.PollCreationMessageV2 != nil || msg.PollCreationMessageV3 != nil {
 		dbMsgType = database.MsgMatrixPoll
 	} else if msg.EditedMessage == nil {
 		portal.MarkDisappearing(nil, origEvtID, time.Duration(portal.ExpirationTime)*time.Second, time.Now())
@@ -4491,7 +4508,7 @@ func (portal *Portal) Cleanup(puppetsOnly bool) {
 		return
 	}
 	intent := portal.MainIntent()
-	if portal.bridge.SpecVersions.UnstableFeatures["com.beeper.room_yeeting"] {
+	if portal.bridge.SpecVersions.Supports(mautrix.BeeperFeatureRoomYeeting) {
 		err := intent.BeeperDeleteRoom(portal.MXID)
 		if err == nil || errors.Is(err, mautrix.MNotFound) {
 			return
