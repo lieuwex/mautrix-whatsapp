@@ -1567,7 +1567,7 @@ func (portal *Portal) UpdateMetadata(user *User, groupInfo *types.GroupInfo, new
 
 	portal.RestrictMessageSending(groupInfo.IsAnnounce)
 	portal.RestrictMetadataChanges(groupInfo.IsLocked)
-	if newsletterMetadata != nil {
+	if newsletterMetadata != nil && newsletterMetadata.ViewerMeta != nil {
 		portal.PromoteNewsletterUser(user, newsletterMetadata.ViewerMeta.Role)
 	}
 
@@ -1936,7 +1936,7 @@ func (portal *Portal) CreateMatrixRoom(user *User, groupInfo *types.GroupInfo, n
 			powerLevels.EnsureEventLevel(event.StateTopic, 50)
 		}
 	}
-	if newsletterMetadata != nil {
+	if newsletterMetadata != nil && newsletterMetadata.ViewerMeta != nil {
 		switch newsletterMetadata.ViewerMeta.Role {
 		case types.NewsletterRoleAdmin:
 			powerLevels.EnsureUserLevel(user.MXID, 50)
@@ -3896,7 +3896,12 @@ func (portal *Portal) preprocessMatrixMedia(ctx context.Context, sender *User, r
 			portal.log.Warnfln("Failed to re-encode %s media: %v, continuing with original file", mimeType, convertErr)
 		}
 	}
-	uploadResp, err := sender.Client.Upload(ctx, data, mediaType)
+	var uploadResp whatsmeow.UploadResponse
+	if portal.Key.JID.Server == types.NewsletterServer {
+		uploadResp, err = sender.Client.UploadNewsletter(ctx, data, mediaType)
+	} else {
+		uploadResp, err = sender.Client.Upload(ctx, data, mediaType)
+	}
 	if err != nil {
 		return nil, exerrors.NewDualError(errMediaWhatsAppUploadFailed, err)
 	}
@@ -4204,6 +4209,8 @@ type extraConvertMeta struct {
 	EditRootMsg *database.Message
 
 	GalleryExtraParts []*waProto.Message
+
+	MediaHandle string
 }
 
 func getEditError(rootMsg *database.Message, editer *User) error {
@@ -4239,6 +4246,9 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 			return nil, sender, extraMeta, errUserNotLoggedIn
 		}
 		sender = portal.GetRelayUser()
+		if !sender.IsLoggedIn() {
+			return nil, sender, extraMeta, errRelaybotNotLoggedIn
+		}
 		isRelay = true
 	}
 	var editRootMsg *database.Message
@@ -4302,6 +4312,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		if media == nil {
 			return nil, sender, extraMeta, err
 		}
+		extraMeta.MediaHandle = media.Handle
 		ctxInfo.MentionedJid = media.MentionedJIDs
 		msg.ImageMessage = &waProto.ImageMessage{
 			ContextInfo:   ctxInfo,
@@ -4320,6 +4331,9 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 			return nil, sender, extraMeta, errGalleryRelay
 		} else if content.BeeperGalleryCaption != "" {
 			return nil, sender, extraMeta, errGalleryCaption
+		} else if portal.Key.JID.Server == types.NewsletterServer {
+			// We don't handle the media handles properly for multiple messages
+			return nil, sender, extraMeta, fmt.Errorf("can't send gallery to newsletter")
 		}
 		for i, part := range content.BeeperGalleryImages {
 			// TODO support videos
@@ -4351,6 +4365,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		if media == nil {
 			return nil, sender, extraMeta, err
 		}
+		extraMeta.MediaHandle = media.Handle
 		ctxInfo.MentionedJid = media.MentionedJIDs
 		msg.StickerMessage = &waProto.StickerMessage{
 			ContextInfo:   ctxInfo,
@@ -4370,6 +4385,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 			return nil, sender, extraMeta, err
 		}
 		duration := uint32(content.GetInfo().Duration / 1000)
+		extraMeta.MediaHandle = media.Handle
 		ctxInfo.MentionedJid = media.MentionedJIDs
 		msg.VideoMessage = &waProto.VideoMessage{
 			ContextInfo:   ctxInfo,
@@ -4390,6 +4406,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		if media == nil {
 			return nil, sender, extraMeta, err
 		}
+		extraMeta.MediaHandle = media.Handle
 		duration := uint32(content.GetInfo().Duration / 1000)
 		msg.AudioMessage = &waProto.AudioMessage{
 			ContextInfo:   ctxInfo,
@@ -4414,6 +4431,7 @@ func (portal *Portal) convertMatrixMessage(ctx context.Context, sender *User, ev
 		if media == nil {
 			return nil, sender, extraMeta, err
 		}
+		extraMeta.MediaHandle = media.Handle
 		msg.DocumentMessage = &waProto.DocumentMessage{
 			ContextInfo:   ctxInfo,
 			Caption:       &media.Caption,
@@ -4561,6 +4579,9 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 		go ms.sendMessageMetrics(evt, err, "Error converting", true)
 		return
 	}
+	if extraMeta == nil {
+		extraMeta = &extraConvertMeta{}
+	}
 	dbMsgType := database.MsgNormal
 	if msg.PollCreationMessage != nil || msg.PollCreationMessageV2 != nil || msg.PollCreationMessageV3 != nil {
 		dbMsgType = database.MsgMatrixPoll
@@ -4575,12 +4596,15 @@ func (portal *Portal) HandleMatrixMessage(sender *User, evt *event.Event, timing
 	} else {
 		info.ID = dbMsg.JID
 	}
-	if dbMsgType == database.MsgMatrixPoll && extraMeta != nil && extraMeta.PollOptions != nil {
+	if dbMsgType == database.MsgMatrixPoll && extraMeta.PollOptions != nil {
 		dbMsg.PutPollOptions(extraMeta.PollOptions)
 	}
 	portal.log.Debugln("Sending event", evt.ID, "to WhatsApp", info.ID)
 	start = time.Now()
-	resp, err := sender.Client.SendMessage(ctx, portal.Key.JID, msg, whatsmeow.SendRequestExtra{ID: info.ID})
+	resp, err := sender.Client.SendMessage(ctx, portal.Key.JID, msg, whatsmeow.SendRequestExtra{
+		ID:          info.ID,
+		MediaHandle: extraMeta.MediaHandle,
+	})
 	timings.totalSend = time.Since(start)
 	timings.whatsmeow = resp.DebugTimings
 	if err != nil {
@@ -4658,7 +4682,9 @@ func (portal *Portal) sendReactionToWhatsApp(sender *User, id types.MessageID, t
 		messageKeyParticipant = proto.String(target.Sender.ToNonAD().String())
 	}
 	key = variationselector.Remove(key)
-	return sender.Client.SendMessage(context.TODO(), portal.Key.JID, &waProto.Message{
+	ctx, cancel := context.WithTimeout(context.TODO(), 60*time.Second)
+	defer cancel()
+	return sender.Client.SendMessage(ctx, portal.Key.JID, &waProto.Message{
 		ReactionMessage: &waProto.ReactionMessage{
 			Key: &waProto.MessageKey{
 				RemoteJid:   proto.String(portal.Key.JID.String()),
@@ -4744,7 +4770,9 @@ func (portal *Portal) HandleMatrixRedaction(sender *User, evt *event.Event) {
 			key.Participant = proto.String(msg.Sender.ToNonAD().String())
 		}
 		portal.log.Debugfln("Sending redaction %s of %s/%s to WhatsApp", evt.ID, msg.MXID, msg.JID)
-		_, err := sender.Client.SendMessage(context.TODO(), portal.Key.JID, &waProto.Message{
+		ctx, cancel := context.WithTimeout(context.TODO(), 60*time.Second)
+		defer cancel()
+		_, err := sender.Client.SendMessage(ctx, portal.Key.JID, &waProto.Message{
 			ProtocolMessage: &waProto.ProtocolMessage{
 				Type: waProto.ProtocolMessage_REVOKE.Enum(),
 				Key:  key,
