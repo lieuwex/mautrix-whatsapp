@@ -1,3 +1,58 @@
+# v0.12.0 (2025-04-16)
+
+* Migrated Signal session store to use new `@lid` identifiers to support future
+  chats that don't expose phone numbers.
+* Added fallbacks for various business message types.
+* Added support for bridging invites, kicks and leaves in groups.
+* Re-added `invite-link`, `join` and `sync` commands for groups.
+* Fixed bridging chats with Meta AI.
+
+# v0.11.4 (2025-03-16)
+
+* Fixed edits being bridged multiple times if a single chat had multiple
+  logged-in Matrix users.
+* Fixed bridging some types of business messages that were supposed to be
+  supported (there are still some unsupported types).
+
+# v0.11.3 (2025-02-16)
+
+* Bumped minimum Go version to 1.23.
+* Added support for signaling supported features to clients using the
+  `com.beeper.room_features` state event.
+* Fixed converting voice message duration and waveform.
+* Fixed padding in stickers sent to WhatsApp sometimes being the wrong color.
+
+# v0.11.2 (2024-12-16)
+
+* Added better notice when view-once messages are unavailable.
+* Fixed some cases of `@lid` user IDs being bridged incorrectly.
+* Fixed starting chats by inviting Matrix ghosts.
+* Updated Docker image to Alpine 3.21.
+
+# v0.11.1 (2024-11-16)
+
+* Added experimental support for direct media. This is not recommended for most
+  users, as WhatsApp media is generally low volume and isn't stored permanently
+  on the server.
+* Re-added support for disabling status broadcasts.
+* Re-added config options for which tag to use for archive/pinned chat bridging.
+* Fixed own reactions sent from other clients in DMs not being bridged correctly.
+* Fixed some bugs with legacy database migration.
+* Fixed group chats not being bridged during initial login if the bridge hits
+  ratelimits.
+
+# v0.11.0 (2024-10-16)
+
+* Bumped minimum Go version to 1.22.
+* Dropped support for unauthenticated media on Matrix.
+* Changed import path to `go.mau.fi/mautrix-whatsapp`.
+* Rewrote bridge using bridgev2 architecture.
+  * It is recommended to check the config file after upgrading. If you have
+    prevented the bridge from writing to the config, you should update it
+    manually.
+  * Group management features and commands are not yet available.
+    If you rely on those, it may be better to wait for the next release.
+
 # v0.10.9 (2024-07-16)
 
 * Added support for receiving Meta AI messages.

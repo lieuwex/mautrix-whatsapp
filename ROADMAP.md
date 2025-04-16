@@ -14,14 +14,14 @@
   * [x] Typing notifications
   * [x] Read receipts
   * [ ] Power level
-  * [x] Membership actions
-    * [x] Invite
-    * [x] Leave
-    * [x] Kick
-  * [x] Room metadata changes
-    * [x] Name
-    * [x] Avatar
-    * [x] Topic
+  * [ ] Membership actions
+    * [ ] Invite
+    * [ ] Leave
+    * [ ] Kick
+  * [ ] Room metadata changes
+    * [ ] Name
+    * [ ] Avatar
+    * [ ] Topic
   * [ ] Initial room metadata
 * WhatsApp → Matrix
   * [x] Message content
