@@ -48,7 +48,7 @@ import (
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
-func (mc *MessageConverter) generateContextInfo(replyTo *database.Message, portal *bridgev2.Portal) (*waE2E.ContextInfo, error) {
+func (mc *MessageConverter) generateContextInfo(ctx context.Context, replyTo *database.Message, portal *bridgev2.Portal) *waE2E.ContextInfo {
 	contextInfo := &waE2E.ContextInfo{}
 	if replyTo != nil {
 		msgID, err := waid.ParseMessageID(replyTo.ID)
@@ -57,7 +57,10 @@ func (mc *MessageConverter) generateContextInfo(replyTo *database.Message, porta
 			contextInfo.Participant = proto.String(msgID.Sender.String())
 			contextInfo.QuotedMessage = &waE2E.Message{Conversation: proto.String("")}
 		} else {
-			return nil, err
+			zerolog.Ctx(ctx).Warn().Err(err).
+				Stringer("reply_to_event_id", replyTo.MXID).
+				Str("reply_to_message_id", string(replyTo.ID)).
+				Msg("Failed to parse reply to message ID")
 		}
 	}
 	if portal.Disappear.Timer > 0 {
@@ -67,7 +70,7 @@ func (mc *MessageConverter) generateContextInfo(replyTo *database.Message, porta
 			contextInfo.EphemeralSettingTimestamp = ptr.Ptr(setAt)
 		}
 	}
-	return contextInfo, nil
+	return contextInfo
 }
 
 func (mc *MessageConverter) ToWhatsApp(
@@ -86,10 +89,7 @@ func (mc *MessageConverter) ToWhatsApp(
 	}
 
 	message := &waE2E.Message{}
-	contextInfo, err := mc.generateContextInfo(replyTo, portal)
-	if err != nil {
-		return nil, nil, err
-	}
+	contextInfo := mc.generateContextInfo(ctx, replyTo, portal)
 
 	switch content.MsgType {
 	case event.MsgText, event.MsgNotice, event.MsgEmote:
@@ -122,7 +122,7 @@ func (mc *MessageConverter) ToWhatsApp(
 				return nil, nil, fmt.Errorf("failed to parse message ID: %w", err)
 			}
 			rootMsgInfo := MessageIDToInfo(client, parsedID)
-			message, err = client.EncryptComment(rootMsgInfo, message)
+			message, err = client.EncryptComment(ctx, rootMsgInfo, message)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to encrypt comment: %w", err)
 			}

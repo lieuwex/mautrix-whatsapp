@@ -41,7 +41,7 @@ import (
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
-func (wa *WhatsAppConnector) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) error {
+func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	w := &WhatsAppClient{
 		Main:      wa,
 		UserLogin: login,
@@ -60,7 +60,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(_ context.Context, login *bridgev2.Us
 
 	var err error
 	w.JID = waid.ParseUserLoginID(login.ID, loginMetadata.WADeviceID)
-	w.Device, err = wa.DeviceStore.GetDevice(w.JID)
+	w.Device, err = wa.DeviceStore.GetDevice(ctx, w.JID)
 	if err != nil {
 		return err
 	}
@@ -71,11 +71,13 @@ func (wa *WhatsAppConnector) LoadUserLogin(_ context.Context, login *bridgev2.Us
 		w.Client.AddEventHandler(w.handleWAEvent)
 		if bridgev2.PortalEventBuffer == 0 {
 			w.Client.SynchronousAck = true
+			w.Client.EnableDecryptedEventBuffer = true
 		}
 		w.Client.AutomaticMessageRerequestFromPhone = true
 		w.Client.GetMessageForRetry = w.trackNotFoundRetry
 		w.Client.PreRetryCallback = w.trackFoundRetry
 		w.Client.SetForceActiveDeliveryReceipts(wa.Config.ForceActiveDeliveryReceipts)
+		w.Client.InitialAutoReconnect = wa.Config.InitialAutoReconnect
 	} else {
 		w.UserLogin.Log.Warn().Stringer("jid", w.JID).Msg("No device found for user in whatsmeow store")
 	}
@@ -221,7 +223,7 @@ func (wa *WhatsAppClient) ConnectBackground(ctx context.Context, params *bridgev
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to update proxy")
 	}
 	wa.Client.GetClientPayload = func() *waWa6.ClientPayload {
-		payload := wa.Client.Store.GetClientPayload()
+		payload := wa.GetStore().GetClientPayload()
 		payload.ConnectReason = waWa6.ClientPayload_PUSH.Enum()
 		return payload
 	}
@@ -324,7 +326,7 @@ func (wa *WhatsAppClient) Disconnect() {
 
 func (wa *WhatsAppClient) LogoutRemote(ctx context.Context) {
 	if cli := wa.Client; cli != nil {
-		err := cli.Logout()
+		err := cli.Logout(ctx)
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to log out")
 		}
@@ -338,7 +340,7 @@ func (wa *WhatsAppClient) IsLoggedIn() bool {
 }
 
 func (wa *WhatsAppClient) syncRemoteProfile(ctx context.Context, ghost *bridgev2.Ghost) {
-	ownID := waid.MakeUserID(wa.Device.GetJID())
+	ownID := waid.MakeUserID(wa.GetStore().GetJID())
 	if ghost == nil {
 		var err error
 		ghost, err = wa.Main.Bridge.GetExistingGhostByID(ctx, ownID)
@@ -352,9 +354,9 @@ func (wa *WhatsAppClient) syncRemoteProfile(ctx context.Context, ghost *bridgev2
 	if ghost.ID != ownID {
 		return
 	}
-	name := wa.Device.BusinessName
+	name := wa.GetStore().BusinessName
 	if name == "" {
-		name = wa.Device.PushName
+		name = wa.GetStore().PushName
 	}
 	if name == "" || wa.UserLogin.RemoteProfile.Name == name && wa.UserLogin.RemoteProfile.Avatar == ghost.AvatarMXC {
 		return

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -99,7 +100,7 @@ func (wa *WhatsAppConnector) Download(ctx context.Context, mediaID networkid.Med
 	}
 	return &mediaproxy.GetMediaResponseFile{
 		Callback: func(f *os.File) error {
-			err := waClient.Client.DownloadToFile(keys, f)
+			err := waClient.Client.DownloadToFile(ctx, keys, f)
 			if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) {
 				val := params["fi.mau.whatsapp.reload_media"]
 				if val == "false" || (!wa.Config.DirectMediaAutoRequest && val != "true") {
@@ -112,13 +113,28 @@ func (wa *WhatsAppConnector) Download(ctx context.Context, mediaID networkid.Med
 					return err
 				}
 				log.Trace().Msg("Retrying download after successful retry")
-				err = waClient.Client.DownloadToFile(keys, f)
+				err = waClient.Client.DownloadToFile(ctx, keys, f)
 			}
 			if errors.Is(err, whatsmeow.ErrFileLengthMismatch) || errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
 				zerolog.Ctx(ctx).Warn().Err(err).Msg("Mismatching media checksums in message. Ignoring because WhatsApp seems to ignore them too")
 			} else if err != nil {
 				return err
 			}
+
+			if keys.MimeType == "application/was" {
+				if _, err := f.Seek(0, io.SeekStart); err != nil {
+					return fmt.Errorf("failed to seek to start of sticker zip: %w", err)
+				} else if zipData, err := io.ReadAll(f); err != nil {
+					return fmt.Errorf("failed to read sticker zip: %w", err)
+				} else if data, err := msgconv.ExtractAnimatedSticker(zipData); err != nil {
+					return fmt.Errorf("failed to extract animated sticker: %w %x", err, zipData)
+				} else if _, err := f.WriteAt(data, 0); err != nil {
+					return fmt.Errorf("failed to write animated sticker to file: %w", err)
+				} else if err := f.Truncate(int64(len(data))); err != nil {
+					return fmt.Errorf("failed to truncate animated sticker file: %w", err)
+				}
+			}
+
 			return nil
 		},
 		// TODO?
