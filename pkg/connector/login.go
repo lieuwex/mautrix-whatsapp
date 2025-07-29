@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
+	"go.mau.fi/util/jsontime"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -321,8 +322,8 @@ func (wl *WALogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 			Name:  wl.LoginSuccess.BusinessName,
 		},
 		Metadata: &waid.UserLoginMetadata{
-			WALID:      wl.LoginSuccess.LID.User,
 			WADeviceID: wl.LoginSuccess.ID.Device,
+			LoggedInAt: jsontime.UnixNow(),
 			Timezone:   wl.Timezone,
 
 			HistorySyncPortalsNeedCreating: true,

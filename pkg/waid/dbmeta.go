@@ -29,13 +29,13 @@ import (
 
 type UserLoginMetadata struct {
 	WADeviceID      uint16        `json:"wa_device_id"`
-	WALID           string        `json:"wa_lid"`
 	PhoneLastSeen   jsontime.Unix `json:"phone_last_seen"`
 	PhoneLastPinged jsontime.Unix `json:"phone_last_pinged"`
 	Timezone        string        `json:"timezone"`
 	PushKeys        *PushKeys     `json:"push_keys,omitempty"`
 	APNSEncPubKey   []byte        `json:"apns_enc_pubkey,omitempty"`
 	APNSEncPrivKey  []byte        `json:"apns_enc_privkey,omitempty"`
+	LoggedInAt      jsontime.Unix `json:"logged_in_at,omitempty"`
 
 	HistorySyncPortalsNeedCreating bool `json:"history_sync_portals_need_creating,omitempty"`
 }
@@ -109,6 +109,7 @@ type PortalMetadata struct {
 	LastSync                   jsontime.Unix        `json:"last_sync,omitempty"`
 	CommunityAnnouncementGroup bool                 `json:"is_cag,omitempty"`
 	AddressingMode             types.AddressingMode `json:"addressing_mode,omitempty"`
+	LIDMigrationAttempted      bool                 `json:"lid_migration_attempted,omitempty"`
 }
 
 type GhostMetadata struct {

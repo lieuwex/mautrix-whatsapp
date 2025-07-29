@@ -1,8 +1,6 @@
 package main
 
 import (
-	"net/http"
-
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
@@ -23,7 +21,7 @@ var m = mxmain.BridgeMain{
 	Name:        "mautrix-whatsapp",
 	URL:         "https://github.com/mautrix/whatsapp",
 	Description: "A Matrix-WhatsApp puppeting bridge.",
-	Version:     "0.12.1",
+	Version:     "0.12.3",
 	Connector:   c,
 }
 
@@ -35,19 +33,19 @@ func main() {
 			"v0.8.6",
 			"v0.11.0",
 			m.LegacyMigrateWithAnotherUpgrader(
-				legacyMigrateRenameTables, legacyMigrateCopyData, 17,
-				upgrades.Table, "whatsapp_version", 3,
+				legacyMigrateRenameTables, legacyMigrateCopyData, 21,
+				upgrades.Table, "whatsapp_version", 5,
 			),
 			true,
 		)
 	}
 	m.PostStart = func() {
 		if m.Matrix.Provisioning != nil {
-			m.Matrix.Provisioning.Router.HandleFunc("/v1/login", legacyProvLogin).Methods(http.MethodGet)
-			m.Matrix.Provisioning.Router.HandleFunc("/v1/logout", legacyProvLogout).Methods(http.MethodPost)
-			m.Matrix.Provisioning.Router.HandleFunc("/v1/contacts", legacyProvContacts).Methods(http.MethodGet)
-			m.Matrix.Provisioning.Router.HandleFunc("/v1/resolve_identifier/{number}", legacyProvResolveIdentifier).Methods(http.MethodGet)
-			m.Matrix.Provisioning.Router.HandleFunc("/v1/pm/{number}", legacyProvResolveIdentifier).Methods(http.MethodPost)
+			m.Matrix.Provisioning.Router.HandleFunc("GET /v1/login", legacyProvLogin)
+			m.Matrix.Provisioning.Router.HandleFunc("POST /v1/logout", legacyProvLogout)
+			m.Matrix.Provisioning.Router.HandleFunc("GET /v1/contacts", legacyProvContacts)
+			m.Matrix.Provisioning.Router.HandleFunc("GET /v1/resolve_identifier/{number}", legacyProvResolveIdentifier)
+			m.Matrix.Provisioning.Router.HandleFunc("POST /v1/pm/{number}", legacyProvResolveIdentifier)
 			m.Matrix.Provisioning.GetAuthFromRequest = legacyProvAuth
 		}
 	}
